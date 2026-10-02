@@ -10,13 +10,13 @@
 |---|---|---|
 | — | 链路验证 + 环境实测 | ✅ 完成（见 `docs/实测记录.md`） |
 | — | 开发计划书 | ✅ 完成（见 `PLAN.md`） |
-| 1 | 核心流水线（CLI，无 GUI） | ⬜ 待开发 |
+| 1 | 核心流水线（CLI，无 GUI） | 🔨 进行中 |
 | 2 | 并发调度 + 断点续跑 | ⬜ 待开发 |
-| 3 | GUI（PySide6） | ⬜ 待开发 |
+| 3 | GUI（Rust + Tauri，Python sidecar） | ⬜ 待开发 |
 | 4 | cookie 自动化 + 汇总模块 | ⬜ 待开发 |
-| 5 | 打包（PyInstaller） | ⬜ 待开发 |
+| 5 | 打包（PyInstaller + Tauri，两层） | ⬜ 待开发 |
 
-**下一步是阶段 1**，验收判据见 `PLAN.md` §8。不要跳阶段。
+**当前正在做阶段 1**（Python 功能层），验收判据见 `PLAN.md` §8。不要跳阶段。
 
 ## 仓库内容边界
 
@@ -25,7 +25,7 @@
 | 类型 | 内容 | 入库 |
 |---|---|---|
 | 源码 | `app/`、`prototypes/`、`tools/` | ✅ |
-| 技术文档 | `PLAN.md`、`README.md`、`docs/实测记录.md`、`prototypes/README.md`、`samples/README.md` | ✅ |
+| 技术文档 | `PLAN.md`、`README.md`、`docs/实测记录.md`、`docs/IPC协议规格.md`、`prototypes/README.md`、`samples/README.md` | ✅ |
 | 配置模板 | `config.example.yaml`、`requirements.txt` | ✅ |
 | 模型权重 | `models/large-v3/`（2.87 GB） | ❌ 自行下载，见「快速开始」第 3 步 |
 | 用户配置 | `config.yaml` | ❌ 含本机路径，自行生成 |
@@ -43,10 +43,12 @@ Vidnote/
 ├── README.md                # 本文件
 ├── requirements.txt         # Python 依赖（含 CUDA 运行库的安装注意事项）
 ├── config.example.yaml      # 配置模板，复制为 config.yaml 使用
-├── app/                     # 正式实现（阶段 1 起填充，按 PLAN.md §4 布局）
+├── app/                     # ★Python 功能层（阶段 1 起填充，按 PLAN.md §4 布局）
 │   ├── core/                #   env_probe / concurrency / dispatcher / store / fetcher / ...
 │   ├── models/              #   Task / Config 数据类
-│   └── ui/                  #   GUI（阶段 3）
+│   ├── cli.py               #   人用入口 + 阶段 1 验收入口
+│   └── rpc.py               #   Rust 宿主入口（sidecar 常驻 worker）
+├── app-ui/                  # ★Rust + Tauri 工程（阶段 3）
 ├── prototypes/              # ★已验证原型脚本，阶段 1 重构的直接输入
 │   ├── transcribe.py        #   → app/core/transcriber.py（含 CUDA DLL 加载的正确实现）
 │   ├── state2cookie.py      #   → app/core/cookies.py
@@ -58,6 +60,7 @@ Vidnote/
 ├── samples/                 # 测试基线（内容不入库，仅 README.md 入库）
 └── docs/
     ├── 实测记录.md           # ★事实源：本机性能实测与环境快照
+    ├── IPC协议规格.md         # ★Rust 宿主 ↔ Python Worker 的接口契约
     └── 样例产出_参考.md       # 产出形态参考（本地留存，不入库）
 ```
 
@@ -72,6 +75,7 @@ Vidnote/
 | yt-dlp | 最新版 | `pip install -U yt-dlp` |
 | Node.js | 仅 cookie 采集需要 | `npm i -g @playwright/cli` |
 | NVIDIA GPU | 显存 ≥ 8 GB（实测 RTX 4060 Ti 16 GB / 驱动 610.88） | 显卡驱动 |
+| Rust 工具链 | **仅阶段 3 起需要**（UI 层用 Tauri），本机尚未安装 | `winget install Rustlang.Rustup` + VS Build Tools |
 | CUDA 运行库 | cublas / cudnn / nvrtc 12.x | 见第 2 步 |
 
 > ⚠️ **GPU 转写是硬要求，不是优化项。**

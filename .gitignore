@@ -47,6 +47,14 @@ build/
 dist/
 *.spec
 
+# ---- Rust / Tauri（阶段 3）----
+# Cargo 构建目录（Tauri 工程位于 app-ui/src-tauri/）
+app-ui/src-tauri/target/
+# 前端依赖与构建产物
+app-ui/node_modules/
+app-ui/dist/
+# 注意：Cargo.lock 对「应用」（非库）应当入库以锁定依赖版本，故此处不忽略
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/

@@ -15,7 +15,12 @@ Pillow>=10.0
 PyYAML>=6.0
 
 # ---- 阶段 3：GUI ----
-# PySide6>=6.7
+# UI 层已改为 Rust + Tauri（见 PLAN.md §7.1），Python 侧不再需要任何 GUI 依赖。
+# Rust 工程位于 app-ui/，其依赖由 Cargo.toml 管理（本机尚未安装 Rust 工具链）。
+
+# ---- 阶段 4：cookie 自动化 ----
+# playwright-cli 由 npm 全局安装，不走 pip：
+#   npm i -g @playwright/cli
 
 # ---- GPU 推理运行时（Windows 必需，DLL 不在 PATH 上）----
 # 注意：PyPI 直连会卡死，必须用国内镜像且禁用代理：

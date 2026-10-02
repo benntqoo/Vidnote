@@ -2,7 +2,7 @@
 
 > **项目**：Vidnote（Video → Note）批量视频内容提取与结构化汇总工具
 > **仓库**：`D:/Code/SideProject/Vidnote`
-> **阶段**：规划完成，待进入阶段 1
+> **阶段**：阶段 1 进行中（Python 功能层基础设施已完成，见 §4 目录树的 ✓ 标记）
 >
 > **交付声明**
 > 本文件为**规划产物**，未编写任何程序实现代码。
@@ -170,29 +170,30 @@ def plan_concurrency(cfg, env):
 
 ```
 Vidnote/                                  # 仓库根
-├── app/                                  # ★正式实现（阶段 1 起填充）
-│   ├── main.py                           # GUI 入口
-│   ├── ui/                               # 阶段 3
-│   │   ├── main_window.py                #   主窗口：任务表格 + 日志 + 控制区
-│   │   ├── task_table.py                 #   任务列表（QTableView + 自定义 model）
-│   │   ├── add_dialog.py                 #   批量粘贴/导入 URL
-│   │   └── settings_dialog.py            #   配置界面
+├── app/                                  # ★Python 功能层（阶段 1 起填充）
 │   ├── core/
-│   │   ├── env_probe.py                  # ★硬件探测 ← 由 tools/probe_env.py 演进而成
-│   │   ├── concurrency.py                # ★§3.2 的计算逻辑
+│   │   ├── env_probe.py                  #   ✓已完成  硬件探测 ← tools/probe_env.py
+│   │   ├── cuda_dll.py                   #   ✓已完成  CUDA DLL 注入（§9.1 三层要求）
+│   │   ├── ffmpeg_locator.py             #   ✓已完成  ffmpeg 定位（§9.4 四级顺序）
+│   │   ├── errors.py                     #   ✓已完成  异常层次
+│   │   ├── store.py                      #   ✓已完成  SQLite 任务状态（断点续跑）
+│   │   ├── urls.py                       #   ✓已完成  分享文案抽 URL + 平台识别（§7.3）
+│   │   ├── concurrency.py                #   ✓已完成  §3.2 的并发计算逻辑
 │   │   ├── dispatcher.py                 #   流水线调度器（队列 + worker 管理）
-│   │   ├── store.py                      #   SQLite 任务状态（断点续跑）
 │   │   ├── cookies.py                    #   cookie 获取/缓存/刷新 ← prototypes/state2cookie.py
 │   │   ├── fetcher.py                    #   下载（yt-dlp 封装）
 │   │   ├── audio.py                      #   抽音频（ffmpeg）
 │   │   ├── transcriber.py                #   转写（faster-whisper）← prototypes/transcribe.py
 │   │   ├── frames.py                     #   抽帧 + 拼版 ← prototypes/make_sheets.py
-│   │   ├── summarizer.py                 #   汇总（可选，API 模式）
-│   │   └── ffmpeg_locator.py             #   ffmpeg 二进制定位
+│   │   └── summarizer.py                 #   汇总（可选，API 模式）
 │   ├── models/
-│   │   ├── task.py                       #   Task / TaskStatus 数据类
-│   │   └── config.py                     #   配置读写（dataclass + yaml）
-│   └── cli.py                            # 阶段 1 的临时入口（GUI 之前先用它验收）
+│   │   ├── task.py                       #   ✓已完成  Task / TaskStatus 数据类
+│   │   └── config.py                     #   ✓已完成  配置读写（dataclass + yaml）
+│   ├── cli.py                            #   人用入口 + 阶段 1 验收入口
+│   └── rpc.py                            #   ★Rust 宿主入口（sidecar 常驻 worker）
+├── app-ui/                               # ★Rust + Tauri 工程（阶段 3）
+│   ├── src-tauri/                        #   Rust 宿主：进程监督器 + 事件分发
+│   └── src/                              #   前端：任务表格 / 进度 / 日志
 ├── prototypes/                           # ★已验证原型，阶段 1 重构的直接输入
 │   ├── transcribe.py  state2cookie.py  make_sheets.py
 │   └── README.md                         #   对应关系、环境假设、不可丢的实现细节
@@ -225,8 +226,29 @@ Vidnote/                                  # 仓库根
 | `transcriber.run(wav)` | wav 路径 | `TranscriptOutput`(txt/srt/json) | 模型加载失败立刻中止**整批**（说明环境坏了，继续跑没意义） |
 | `frames.run(video)` | mp4 路径 | `list[Path]`（拼版图） | 失败只记 warning，**不阻断流程**（画面是可选产物） |
 | `summarizer.run(transcript)` | 转写 JSON | md 路径 | API 失败重试 3 次后标记 `failed`，**不影响转写稿交付** |
+| `rpc.serve()` | stdin 命令流 | stdout 事件流 | 协议见 `docs/IPC协议规格.md`；worker 崩溃由宿主重启一次 |
 
 **关键设计原则：转写是唯一"失败即整批中止"的阶段，其余阶段失败都只影响单条任务。** 因为转写失败通常意味着环境问题（CUDA/模型损坏），继续跑只会浪费时间和配额。
+
+### 4.2 进度上报契约（双入口共用）
+
+所有耗时函数（`fetcher` / `audio` / `transcriber` / `frames` / `summarizer`）签名统一附加一个可选参数：
+
+```python
+def run(..., on_progress: Callable[[str, float], None] | None = None) -> ...:
+    # on_progress(stage: str, progress: float)
+    #   stage    —— 中文阶段名，取值见 docs/IPC协议规格.md §5
+    #   progress —— 0.0~1.0；-1.0 表示"进行中但进度不可知"
+```
+
+**为何现在就要加**：`cli.py` 与 `rpc.py` 是两个入口，唯一的共同钩子就是这个回调。
+若等阶段 3 再补，需要改动全部调用点及其调用方。
+
+- `cli.py` 传 `None`（或传一个打到 stderr 的打印函数）
+- `rpc.py` 传一个把 `(stage, progress)` 转成 `task_update` 事件的函数
+
+**`app/core/` 不得感知传输方式**：不 `print`、不 `sys.exit`、不读 `argv`、不直接写 stdout。
+所有输出经回调或异常向上传递——这是「同一套核心既能跑 CLI 又能被 Rust 驱动」的前提。
 
 ---
 
@@ -326,16 +348,39 @@ pending ──▶ downloading ──▶ downloaded ──▶ transcribing ──
 
 ## 7. GUI 设计
 
-### 7.1 技术选型：PySide6（Qt）
+### 7.1 技术选型：Tauri（Rust）+ Python sidecar
+
+> **2026-10-02 修订**：原选型为 PySide6，因头头要求「高性能桌面端」而重新评估。
+> 关键结论：**转写吞吐换语言换不来**——瓶颈在 GPU + CTranslate2（C++/CUDA），Python 只是那层胶水。
+> 但 **UI 层与分发形态** Rust 确有优势。故分层：**UI 用 Rust，功能层保留 Python**。
+>
+> 佐证（2026 多源实测）：`whisper.cpp`（Rust 侧唯一的 Whisper 绑定 `whisper-rs` 的底层）在 N 卡上
+> **比 faster-whisper 慢**——large-v3 CUDA 23× vs 15×、RTX 4070 上 12× vs 8×。
+> 本机现为 8.7×，换 Rust 是**负收益**。
 
 | 候选 | 判断 |
 |---|---|
-| **PySide6** ✅ | 原生窗口、`QTableView` 天然适合批量任务列表、QThread + 信号槽处理异步、PyInstaller 打包成熟 |
-| Tkinter | 标准库零依赖，但表格控件弱、界面老旧，批量场景体验差 |
-| Streamlit / Flet | 本质是浏览器界面，不是你要的"桌面窗口" |
-| Electron | 为这个规模引入前端构建链，过重 |
+| **Tauri (Rust)** ✅ | 官方支持 sidecar（`bundle.externalBin`）spawn 常驻 Python 进程；UI 用 HTML/CSS 写批量表格成本最低；产物为原生安装包，用户侧无需 Python 运行时 |
+| egui / iced（纯 Rust） | 无 WebView 依赖、体积更小。但表格控件需自建，生态远弱于 Web/Qt，而本项目核心 UI 恰是批量任务表格 |
+| PySide6 | 原选型。原生 Qt + `QTableView`，开发最快。**代价是 UI 层与分发形态拿不到 Rust 的收益** |
+| Streamlit / Flet / Electron | 为这个规模引入过重构建链，或不是你要的"桌面窗口" |
 
-### 7.2 窗口布局
+**为何不用 PyO3 内嵌 Python 解释器**：`§9.1` 的 CUDA DLL 注入是**进程级全局状态**
+（句柄保活 + `PATH` 注入 + 必须在 `import ctranslate2` 之前执行）。一旦 Python 被嵌进 Rust 进程，
+这些操作会改写宿主自身的 DLL 搜索路径，行为不可控且打包后极易失败。
+
+**为何 Python 侧仍需 yt-dlp**：yt-dlp 无 Rust 等价物（社区 Rust 方案均为单平台或个人项目），
+且「支持 1900+ 平台」的同类工具本身就是 yt-dlp 套壳。Rust 侧同样只能 subprocess 调它。
+
+**代价（已知并接受）**：
+- 本机 `rustc` / `cargo` / `rustup` **均未安装**，需先装 Rust 工具链 + MSVC build tools
+- 分发包 = Tauri 安装包 + PyInstaller 目录（**两层打包**，见 §8 阶段 5）
+- 内存与启动收益仅**部分**——Python 进程的运行时开销并未消除
+
+**接口契约**：Rust 与 Python 之间的一切约定见 **`docs/IPC协议规格.md`**
+（stdin/stdout + JSON Lines，零端口；stdout 只走协议、日志全走 stderr）。
+
+### 7.2 窗口布局（Rust 前端实现，信息架构不变）
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -406,21 +451,26 @@ URL_PATTERNS = {
   - 杀掉进程后重启，已完成的不重跑（检查 `state.db` 的 status）
   - 故意混入 1 条坏链接，确认它失败后**其他 9 条正常完成**
 
-### 阶段 3：GUI
+### 阶段 3：GUI（Rust + Tauri）
 
 - 目标：双击启动，粘贴链接，点开始，看进度，完成后能打开目录
-- 交付：`main_window.py` + `task_table.py` + `add_dialog.py`
-- 验收：见 §10 验收清单
+- 交付：`app-ui/`（Tauri 工程：`src-tauri/` 宿主 + `src/` 前端）+ `app/rpc.py` 完整实现
+- 前置：Rust 工具链 + MSVC build tools（本机未安装，需先补）
+- 验收：见 §10 验收清单，**外加** `docs/IPC协议规格.md` §9 的全部 8 条协议判据
 
 ### 阶段 4：cookie 自动化 + 汇总模块
 
 - 目标：抖音 cookie 过期时能自动重取（调 playwright）；汇总可开关
 - 验收：手动把 `cookies.txt` 改坏，程序能检测到并自动重新采集
 
-### 阶段 5：打包
+### 阶段 5：打包（两层）
 
-- 用 PyInstaller 打成单目录（不是单文件——单文件解压慢且模型路径处理麻烦）
-- 验收：在没装 Python 的环境变量下双击能启动（同机模拟）
+- **Python 侧**：用 PyInstaller 打成**单目录**（不是单文件——单文件解压慢且模型路径处理麻烦），
+  产物作为 Tauri 的 `externalBin` sidecar 随包分发
+- **Rust 侧**：Tauri bundler 出平台安装包
+- 验收：在**没装 Python、也没装 Rust** 的机器上双击能启动（同机模拟）
+- ⚠️ **本阶段风险最高**：CUDA DLL 随 PyInstaller 分发本就未验证（§11.5），
+  叠加 Tauri sidecar 与两层构建链后复杂度翻倍。建议在阶段 3 末期就做一次最小打包验证，不要拖到最后
 
 ---
 
@@ -558,14 +608,27 @@ add_nvidia_dll_dirs()
 2. **并发正确性**：流水线架构是设计推断，**未经实测**。阶段 2 的验收标准（10 条批量的总耗时）就是用来证伪它的。
 3. **B站 / YouTube 的实际可用性**：本机从未测过这两个平台。YouTube 在国内需代理，B站部分视频需登录。**建议阶段 1 只做抖音，跑通后再扩展。**
 4. **汇总模块的 token 成本**：一条 20 分钟视频转写稿约 8000–10000 字，是否超出所选模型的上下文、单条成本多少，**未测**。
-5. **PyInstaller 打包**：PySide6 + ctranslate2 + CUDA DLL 的打包有已知复杂度（CUDA DLL 需要随包分发），**未验证**。
+5. **两层打包**：PyInstaller（ctranslate2 + CUDA DLL，DLL 需随包分发）+ Tauri bundler，**未验证**，复杂度高于原单层方案。
 6. **GPU 并发是否真的无收益**：§3.1 断言"GPU 转写开 2 个实例不会提升吞吐"，这是基于显存与算力分时复用的推断，**未实测**。若要验证，可本地跑双实例对照——但如果阶段 2 验收达标，就没有必要验证。
+7. **Rust UI 与 IPC 协议**：`docs/IPC协议规格.md` 是 2026-10-02 新设计的契约，**未经端到端实测**。
+   其协议层验收判据（该文档 §9，共 8 条）可用 Python mock client 独立跑通，**不必等 Rust 工程建起来**——建议在阶段 1 收尾前先跑一遍。
+8. **Rust 侧产出未验证的自有风险**：本机 `rustc`/`cargo` 未安装，`app-ui/` 尚未创建。Tauri 的 sidecar 机制、Windows Job Object 进程回收、WebView2 依赖分发性，均**未在本机验证**。
 
 ---
 
 ## 12. 建议的下一步
 
-按 `§8` 顺序走，**不要跳阶段**。最该先做的是**阶段 1**——把 `prototypes/` 下那三个已经跑通的脚本（`state2cookie.py` / `transcribe.py` / `make_sheets.py`）重构成 `app/core/` 下的正式模块。它们已经被 2026-10-02 那一轮真实任务验证过，是整套系统里最可靠的部分。
+### 12.1 架构已定（2026-10-02）
+
+**UI 层 = Rust + Tauri；功能层 = Python（复用，不重写）。** 接口契约见 `docs/IPC协议规格.md`。
+
+这一变更**不产生返工**：阶段 1-2 的 Python 核心本就是「功能层」，只有阶段 3 的 GUI 换了实现语言。
+详细选型论证见 §7.1；理由速览：转写吞吐由 GPU + CTranslate2(C++) 决定，换语言无收益，
+而 Rust 的收益（UI 流畅度、分发形态）全部落在阶段 3 之后。
+
+### 12.2 推进顺序
+
+按 `§8` 顺序走，**不要跳阶段**。当前处于**阶段 1**——把 `prototypes/` 下那三个已经跑通的脚本（`state2cookie.py` / `transcribe.py` / `make_sheets.py`）重构成 `app/core/` 下的正式模块。它们已经被 2026-10-02 那一轮真实任务验证过，是整套系统里最可靠的部分。
 
 `prototypes/README.md` 列了每个脚本对应的目标模块、必须保留的实现细节（尤其是 CUDA DLL 加载那三层要求）、以及**不该照抄的部分**（命令行参数解析不该进核心模块）。
 
