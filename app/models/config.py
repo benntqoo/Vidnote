@@ -48,15 +48,25 @@ class PathsConfig:
     model_dir: str = "models"
     # None 表示按 ffmpeg_locator 的四级顺序自动定位（PLAN.md §9.4）
     ffmpeg: str | None = None
+    # None 表示按 yt_dlp_locator 的顺序自动定位（config → PATH）
+    yt_dlp: str | None = None
+    # Netscape 格式 cookies.txt。None 表示不带 cookie 下载（公开视频可用；
+    # 抖音多数内容需要，见 PLAN.md §9.5 —— ttwid 约 24 小时过期）
+    cookies_file: str | None = None
 
     def resolve(self, root: Path) -> PathsConfig:
         """把相对路径锚定到项目根目录。"""
         work = Path(self.work_dir).expanduser()
         model = Path(self.model_dir).expanduser()
+        cookies = Path(self.cookies_file).expanduser() if self.cookies_file else None
         return PathsConfig(
             work_dir=str(work if work.is_absolute() else root / work),
             model_dir=str(model if model.is_absolute() else root / model),
             ffmpeg=self.ffmpeg,
+            yt_dlp=self.yt_dlp,
+            cookies_file=(
+                str(cookies if cookies.is_absolute() else root / cookies) if cookies else None
+            ),
         )
 
 

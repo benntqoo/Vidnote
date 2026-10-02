@@ -179,18 +179,20 @@ Vidnote/                                  # 仓库根
 │   │   ├── store.py                      #   ✓已完成  SQLite 任务状态（断点续跑）
 │   │   ├── urls.py                       #   ✓已完成  分享文案抽 URL + 平台识别（§7.3）
 │   │   ├── concurrency.py                #   ✓已完成  §3.2 的并发计算逻辑
-│   │   ├── dispatcher.py                 #   流水线调度器（队列 + worker 管理）
-│   │   ├── cookies.py                    #   cookie 获取/缓存/刷新 ← prototypes/state2cookie.py
-│   │   ├── fetcher.py                    #   下载（yt-dlp 封装）
-│   │   ├── audio.py                      #   抽音频（ffmpeg）
-│   │   ├── transcriber.py                #   转写（faster-whisper）← prototypes/transcribe.py
-│   │   ├── frames.py                     #   抽帧 + 拼版 ← prototypes/make_sheets.py
-│   │   └── summarizer.py                 #   汇总（可选，API 模式）
+│   │   ├── urls.py                       #   ✓已完成  分享文案抽 URL + 平台识别（§7.3）
+│   │   ├── fetcher.py                    #   ✓已完成  下载（yt-dlp 封装 + 本地文件接入）
+│   │   ├── audio.py                      #   ✓已完成  抽音频（ffmpeg → 16k/mono/s16）
+│   │   ├── transcriber.py                #   ✓已完成  转写（faster-whisper）← prototypes/transcribe.py
+│   │   ├── frames.py                     #   ✓已完成  抽帧 + 拼版 ← prototypes/make_sheets.py
+│   │   ├── pipeline.py                   #   ✓已完成  单条执行器（cli / rpc / 阶段2 dispatcher 共用）
+│   │   ├── dispatcher.py                 #   阶段 2  流水线调度器（队列 + worker 管理）
+│   │   ├── cookies.py                    #   阶段 4  cookie 获取/缓存/刷新 ← prototypes/state2cookie.py
+│   │   └── summarizer.py                 #   阶段 4  汇总（可选，API 模式）
 │   ├── models/
 │   │   ├── task.py                       #   ✓已完成  Task / TaskStatus 数据类
 │   │   └── config.py                     #   ✓已完成  配置读写（dataclass + yaml）
-│   ├── cli.py                            #   人用入口 + 阶段 1 验收入口
-│   └── rpc.py                            #   ★Rust 宿主入口（sidecar 常驻 worker）
+│   ├── cli.py                            #   ✓已完成  人用入口 + 阶段 1 验收入口
+│   └── rpc.py                            #   ✓协议层已完成  ★Rust 宿主入口（sidecar 常驻 worker）
 ├── app-ui/                               # ★Rust + Tauri 工程（阶段 3）
 │   ├── src-tauri/                        #   Rust 宿主：进程监督器 + 事件分发
 │   └── src/                              #   前端：任务表格 / 进度 / 日志
@@ -216,19 +218,26 @@ Vidnote/                                  # 仓库根
 
 ### 4.1 各模块接口契约
 
-| 模块 | 输入 | 输出 | 失败行为 |
+| 模块 | 签名 | 输出 | 失败行为 |
 |---|---|---|---|
-| `env_probe.probe()` | — | `EnvReport`（cpu/mem/disk/gpu/cuda） | 探测项失败返回 `None`，不抛异常 |
-| `concurrency.plan()` | `Config, EnvReport` | `Concurrency` | 内存读取失败时回退到保守值 `(1,2,1,1)` |
-| `cookies.ensure(platform)` | 平台名 | `Path`（cookies.txt） | 无效则抛 `CookieExpired`，由 GUI 提示用户操作浏览器 |
-| `fetcher.download(task)` | `Task` | `Task.video_path` | 记录 stderr 尾 20 行到 `Task.error`，标记 `failed` |
-| `audio.extract(video)` | mp4 路径 | wav 路径 | ffmpeg 非 0 退出则抛 `StageError` |
-| `transcriber.run(wav)` | wav 路径 | `TranscriptOutput`(txt/srt/json) | 模型加载失败立刻中止**整批**（说明环境坏了，继续跑没意义） |
-| `frames.run(video)` | mp4 路径 | `list[Path]`（拼版图） | 失败只记 warning，**不阻断流程**（画面是可选产物） |
-| `summarizer.run(transcript)` | 转写 JSON | md 路径 | API 失败重试 3 次后标记 `failed`，**不影响转写稿交付** |
-| `rpc.serve()` | stdin 命令流 | stdout 事件流 | 协议见 `docs/IPC协议规格.md`；worker 崩溃由宿主重启一次 |
+| `env_probe.probe()` | `(work_dir=None)` | `EnvReport`（cpu/mem/disk/gpu/cuda） | 探测项失败返回 `None`，不抛异常 |
+| `env_probe.verify_cuda()` | `(model_path, device, compute_type)` | `(bool, str)` | 真实推理验证，绝不抛异常 |
+| `concurrency.plan()` | `(cfg, env, gpu_usable=None)` | `Concurrency` | 内存读取失败时回退到保守值 `(1,2,1,1)` |
+| `fetcher.download()` | `(task, cfg, out_dir, on_progress=None)` | `DownloadResult` | 抛 `StageError`，消息含 yt-dlp 输出尾 20 行 |
+| `audio.extract()` | `(video, out_path, ffmpeg_path=None, total_sec=None, on_progress=None)` | `Path`（wav） | ffmpeg 非 0 退出则抛 `StageError` |
+| `transcriber.run()` | `(wav, model_path, out_prefix, *, language, beam_size, ...)` | `TranscriptOutput`(txt/srt/json) | 模型加载失败抛 `FatalEnvironmentError`，**中止整批** |
+| `frames.run()` | `(video, out_dir, *, scene_threshold, ...)` | `FramesResult`（拼版图 + 索引） | 抛 `StageError`，调用方决定降级 |
+| `pipeline.run_one()` | `(task, cfg, store, *, on_progress=None, on_stage=None)` | `Task`（状态已更新） | 捕获单条错误并写库；环境级故障继续上抛 |
+| `cookies.ensure(platform)` | 阶段 4 | `Path`（cookies.txt） | 无效则抛 `CookieExpired` |
+| `summarizer.run(transcript)` | 阶段 4 | md 路径 | API 失败重试 3 次后标记 `failed` |
+| `rpc.serve()` | `()` | stdout 事件流 | 协议见 `docs/IPC协议规格.md`；worker 崩溃由宿主重启一次 |
 
 **关键设计原则：转写是唯一"失败即整批中止"的阶段，其余阶段失败都只影响单条任务。** 因为转写失败通常意味着环境问题（CUDA/模型损坏），继续跑只会浪费时间和配额。
+
+**状态归属**：`fetcher` / `audio` / `transcriber` / `frames` **都不写任务状态、不碰 `store`**，
+它们只抛异常；状态流转（`downloading → downloaded → transcribing → …`）由
+`pipeline.run_one()` 统一负责。这样每个阶段模块都是纯功能函数，可以独立测试，
+也避免四个模块各自解释状态机。
 
 ### 4.2 进度上报契约（双入口共用）
 
@@ -237,15 +246,24 @@ Vidnote/                                  # 仓库根
 ```python
 def run(..., on_progress: Callable[[str, float], None] | None = None) -> ...:
     # on_progress(stage: str, progress: float)
-    #   stage    —— 中文阶段名，取值见 docs/IPC协议规格.md §5
+    #   stage    —— 阶段标识，**用 TaskStatus 的英文值**：
+    #               "downloading" | "audio" | "transcribing" | "framing" | "summarizing"
+    #               （"audio" 是 downloaded→transcribing 之间的过渡阶段，无独立 status）
     #   progress —— 0.0~1.0；-1.0 表示"进行中但进度不可知"
 ```
+
+**stage 用英文标识而不是中文**：中文是**展示层**的事，`rpc.py` 用 `STAGE_LABELS`
+把 status 映射成「下载中 / 转写中…」，UI 侧只消费映射结果。core 层不该内嵌 UI 文案。
+
+**`on_stage` 与 `on_progress` 是两个回调**：前者只在**状态跃迁**时触发（低频率，
+供 UI 刷新表格行），后者是高频进度（需限流，见 `docs/IPC协议规格.md` §4.1）。
+合并成一个会让调用方不得不自己判断"这次是状态还是进度"。
 
 **为何现在就要加**：`cli.py` 与 `rpc.py` 是两个入口，唯一的共同钩子就是这个回调。
 若等阶段 3 再补，需要改动全部调用点及其调用方。
 
-- `cli.py` 传 `None`（或传一个打到 stderr 的打印函数）
-- `rpc.py` 传一个把 `(stage, progress)` 转成 `task_update` 事件的函数
+- `cli.py` 传一个打到 stderr 的打印函数（每 5% 一行，避免 649 段刷屏）
+- `rpc.py` 传一个把 `(stage, progress)` 转成 `task_update` 事件的函数（带 200 ms 限流）
 
 **`app/core/` 不得感知传输方式**：不 `print`、不 `sys.exit`、不读 `argv`、不直接写 stdout。
 所有输出经回调或异常向上传递——这是「同一套核心既能跑 CLI 又能被 Rust 驱动」的前提。
@@ -273,7 +291,8 @@ transcribe:
   language: "zh"
   beam_size: 5
   vad_filter: true
-  initial_prompt: ""                  # 领域术语提示，可留空
+  vad_min_silence_ms: 400             # ⚠️ 与 beam_size 一同决定分段边界，改动即破坏验收
+  initial_prompt: ""                  # ⚠️ 强参数：会改变分段与标点风格，见 §8 阶段 1
 
 frames:
   enabled: false                      # 默认关：多数口播视频画面无信息量
@@ -433,14 +452,20 @@ URL_PATTERNS = {
 
 ### 阶段 1：核心流水线（CLI，无 GUI）
 
-- 目标：`python -m app.cli --url <url>` 能跑通单条，产出目录结构正确
-- 交付：`fetcher / audio / transcriber / store` 四个模块 + 一个临时 CLI
-- 验收：跑通本轮的抖音链接，产出的转写稿与 `samples/transcript_gpu.txt` **逐字符比对**
+- 目标：`python -m app.cli run <url|本地文件>` 能跑通单条，产出目录结构正确
+- 交付：`fetcher / audio / transcriber / frames` + `pipeline`（单条执行器）+ `cli` 临时入口
+- 验收：产出转写稿与 `samples/transcript_gpu.txt` **逐字符比对**
   - ⚠️ 该基线**保留在本地磁盘但不入库**（派生自第三方视频），新机器 clone 后需自备，见 `samples/README.md`
-  - **实测结论：同配置下转写是确定性的** —— 同模型/同参数/同硬件的两次独立运行，产出 **100% 逐字符一致**（649 段 / 12094 字符完全吻合，见 `docs/实测记录.md` §2.3）
+  - **实测结论：同配置下转写是确定性的** —— 同模型/同参数/同硬件的多次独立运行，产出逐字节一致
+    （2026-10-03 又跑了三次 `--force` 重跑验证，仍逐字节一致，见 `docs/实测记录.md` §2.4）
   - 因此判据就用**严格相等**。出现差异即说明环境或参数变了，是有意义的信号，**不要放宽判据**
   - 注意跨配置不复现：GPU 与 CPU 两版基线差 3 段（649 vs 646），比对前先确认用的是哪个基线
+  - 🔴 **2026-10-03 发现的阻塞：现有基线不可复现**。基线产生时用过 `initial_prompt`
+    （领域术语提示），而该字符串未记录在任何文件中。实测证据：正式实现与原型脚本在同参数下
+    产出**逐字节一致**，说明实现无误；差异全部归结于 `initial_prompt` 的取值。
+    处置方案待定，详见 `docs/实测记录.md` §2.4
 - **这一阶段必须先跑通，再碰 GUI。** GUI 只是壳，壳下面没有能跑的核心是最大的返工来源。
+
 
 ### 阶段 2：并发调度 + 断点续跑
 
@@ -540,6 +565,20 @@ add_nvidia_dll_dirs()
 
 **明确排除** `ms-playwright` 目录。
 
+#### 9.4.1 更隐蔽的一个：WinGet `Links/` 里的 0 字节占位文件（2026-10-03 实测踩到）
+
+**现象**：`shutil.which("ffmpeg")` 成功返回
+`%LOCALAPPDATA%/Microsoft/WinGet/Links/ffmpeg.exe`，但 `subprocess` 调它直接抛
+`OSError: [WinError 193] %1 不是有效的 Win32 应用程序`。
+
+**根因**：WinGet 会在 `Links/` 下放 **0 字节的占位文件**（app execution alias），
+它既不是 symlink 也不是 reparse point，`os.path.getsize()` 为 0、无 `MZ` 头。
+它出现在 PATH 上，所以 `which()` 会命中——**"找到了"不等于"能用"**。
+
+**解法**：候选必须过**有效性校验**——存在 + 非空 + 前两字节为 `MZ`（PE 头）。
+校验不过就继续往下搜，最终落到 `WinGet/Packages/` 里的真实可执行。
+`ffmpeg_locator._is_usable_executable()` 实现，`ffmpeg_available()` 因此也从"误报可用"变为可信。
+
 ### 9.5 抖音 cookie
 
 - `yt-dlp --cookies-from-browser edge|chrome` 在 Windows 新版浏览器上**基本必然失败**（Edge：`Failed to decrypt with DPAPI`；Chrome：`Could not copy Chrome cookie database`）。不要浪费时间在这条路上。
@@ -613,6 +652,11 @@ add_nvidia_dll_dirs()
 7. **Rust UI 与 IPC 协议**：`docs/IPC协议规格.md` 是 2026-10-02 新设计的契约，**未经端到端实测**。
    其协议层验收判据（该文档 §9，共 8 条）可用 Python mock client 独立跑通，**不必等 Rust 工程建起来**——建议在阶段 1 收尾前先跑一遍。
 8. **Rust 侧产出未验证的自有风险**：本机 `rustc`/`cargo` 未安装，`app-ui/` 尚未创建。Tauri 的 sidecar 机制、Windows Job Object 进程回收、WebView2 依赖分发性，均**未在本机验证**。
+9. 🔴 **基线缺参数记录 → 原基线不可复现**（2026-10-03 实测）。基线生成时用过
+   `initial_prompt`（领域术语提示），该字符串未落盘。已实测证实：正式实现与原型脚本在同参数下
+   **逐字节一致**、三次重跑**逐字节一致**，差异只归因于 `initial_prompt` 的取值。
+   处置待定，证据见 `docs/实测记录.md` §2.4。
+   **流程教训**：验收基线必须与产生它的完整参数一起存档，否则"金标准"无法验证。
 
 ---
 

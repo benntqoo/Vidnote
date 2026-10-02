@@ -10,13 +10,18 @@
 |---|---|---|
 | — | 链路验证 + 环境实测 | ✅ 完成（见 `docs/实测记录.md`） |
 | — | 开发计划书 | ✅ 完成（见 `PLAN.md`） |
-| 1 | 核心流水线（CLI，无 GUI） | 🔨 进行中 |
+| 1 | 核心流水线（CLI，无 GUI） | 🔨 实现完成，**验收受阻**（见下） |
 | 2 | 并发调度 + 断点续跑 | ⬜ 待开发 |
 | 3 | GUI（Rust + Tauri，Python sidecar） | ⬜ 待开发 |
 | 4 | cookie 自动化 + 汇总模块 | ⬜ 待开发 |
 | 5 | 打包（PyInstaller + Tauri，两层） | ⬜ 待开发 |
 
-**当前正在做阶段 1**（Python 功能层），验收判据见 `PLAN.md` §8。不要跳阶段。
+**阶段 1 的实现已跑通全链路**（下载 → 抽音频 → GPU 转写 → 落库，实测 2 分 19 秒/20 分钟视频），
+并与原型脚本在同参数下产出**逐字节一致**。但**原基线 `samples/transcript_gpu.txt` 不可复现**——
+它产生时用过 `initial_prompt`，而那个字符串没记录在任何文件里。证据与处置见
+`docs/实测记录.md` §2.4。
+
+> **流程教训**：验收基线必须与产生它的完整参数一起存档。只存产出不存参数，"金标准"不可验证。
 
 ## 仓库内容边界
 
@@ -43,8 +48,10 @@ Vidnote/
 ├── README.md                # 本文件
 ├── requirements.txt         # Python 依赖（含 CUDA 运行库的安装注意事项）
 ├── config.example.yaml      # 配置模板，复制为 config.yaml 使用
-├── app/                     # ★Python 功能层（阶段 1 起填充，按 PLAN.md §4 布局）
-│   ├── core/                #   env_probe / concurrency / dispatcher / store / fetcher / ...
+├── app/                     # ★Python 功能层
+│   ├── core/                #   env_probe / cuda_dll / ffmpeg_locator / store / urls
+│   │                        #   concurrency / fetcher / audio / transcriber / frames
+│   │                        #   pipeline（单条执行器，cli 与 rpc 共用）
 │   ├── models/              #   Task / Config 数据类
 │   ├── cli.py               #   人用入口 + 阶段 1 验收入口
 │   └── rpc.py               #   Rust 宿主入口（sidecar 常驻 worker）
@@ -55,7 +62,8 @@ Vidnote/
 │   ├── make_sheets.py       #   → app/core/frames.py
 │   └── README.md            #   各脚本的接口与环境假设
 ├── tools/
-│   └── probe_env.py         #   → app/core/env_probe.py（硬件探测，已实跑）
+│   ├── probe_env.py         #   → app/core/env_probe.py（硬件探测，已实跑）
+│   └── rpc_smoke.py         #   IPC 协议冒烟测试（13 条判据，不依赖 Rust 端）
 ├── models/                  # 模型权重目录（内容不入库，需自行下载）
 ├── samples/                 # 测试基线（内容不入库，仅 README.md 入库）
 └── docs/
@@ -122,19 +130,36 @@ cp config.example.yaml config.yaml
 ### 5. 环境自检
 
 ```bash
-python tools/probe_env.py
+python -m app.cli env            # 秒级：CPU/内存/磁盘/GPU/ffmpeg/yt-dlp/模型
+python -m app.cli env --verify   # 额外跑一次真实推理确认 CUDA（约 5 秒，占 3 GB 显存）
 ```
 
-确认输出中 GPU 可用。
+确认输出中 GPU 可用、模型存在、ffmpeg 与 yt-dlp 已定位。
 
 > ⚠️ `ctranslate2.get_cuda_device_count() == 1` **不代表 GPU 可用**，只代表检测到硬件。
-> 真正的验证是跑一次真实推理。
+> 真正的验证是跑一次真实推理——这就是 `--verify` 做的事。
 
-### 6. 运行（阶段 1 完成后）
+### 6. 运行
 
 ```bash
-python -m app.cli --url "https://v.douyin.com/xxxxx/"
+# 单条在线链接（抖音分享文案可直接粘贴，会自动抽 URL）
+python -m app.cli run "https://v.douyin.com/xxxxx/" --cookies cookies.txt
+
+# 本地文件
+python -m app.cli run samples/video.mp4 --no-frames
+
+# 批量（从文本文件，每行一条）
+python -m app.cli run --file urls.txt --limit 10
+
+# 查看任务表
+python -m app.cli list
 ```
+
+产出结构：`<work_dir>/<四位序号>_<安全标题>/`，内含
+`video.mp4 / audio.wav / transcript.{txt,srt,json} / frames/ / sheets/`。
+
+常用开关：`--initial-prompt`（领域术语提示，**会改变分段与标点**，见 `docs/实测记录.md` §2.4）、
+`--frames`、`--retry`、`--force`（删产出重跑）、`--dry-run`。
 
 ## samples/ — 测试基线（本地留存，不入库）
 
@@ -149,7 +174,12 @@ python -m app.cli --url "https://v.douyin.com/xxxxx/"
 | `frames_index.json` | 场景抽帧索引（212 帧，含每帧时间戳） |
 | `sheets/` | 抽帧拼版产出样例（9 张 6×4 网格） |
 
-**基线比对建议**：同配置下转写**可逐字符复现**（实测 100% 一致，见 `docs/实测记录.md` §2.3），所以阶段 1 验收直接用严格相等即可。跨配置（GPU ↔ CPU）**不复现**——两版基线本身差 3 段（649 vs 646），比对前先确认用哪个基线。
+**基线比对建议**：同配置下转写**可逐字符复现**（多次独立运行逐字节一致，见 `docs/实测记录.md` §2.3 / §2.4），所以阶段 1 验收直接用严格相等即可。跨配置（GPU ↔ CPU）**不复现**——两版基线本身差 3 段（649 vs 646），比对前先确认用哪个基线。
+
+> 🔴 **2026-10-03：现有基线不可复现。** 重跑得到 681 段（碎句），基线是 649 段（整句带标点）。
+> 已实测排除实现错误、参数、环境漂移三类原因——真因是基线产生时用过 `initial_prompt`，
+> 而该字符串未落盘。完整证据链见 `docs/实测记录.md` §2.4。
+> 在基线定稿前，`samples/transcript_gpu.txt` **不能作为验收依据**。
 
 ## 已知坑（实现时必读 PLAN.md §9）
 
@@ -159,6 +189,8 @@ python -m app.cli --url "https://v.douyin.com/xxxxx/"
 4. **ffmpeg 9.0 移除了 `-vsync`** —— 改用 `-fps_mode passthrough`。
 5. **yt-dlp 读浏览器 cookie 在 Windows 新版浏览器上必失败** —— 走 playwright-cli 导出 storage-state 再转 Netscape 格式。
 6. Playwright 自带的 ffmpeg 是 `--disable-everything` 构建，**没有 mp4 demuxer**，不能用。
+7. **WinGet `Links/` 下的 `ffmpeg.exe` 是 0 字节占位文件**（app execution alias）——`shutil.which()` 能命中，但调用会报 `[WinError 193] 不是有效的 Win32 应用程序`。定位时必须校验「非空 + PE 头 `MZ`」，真实可执行在 `WinGet/Packages/Gyan.FFmpeg_*/`。
+8. **`initial_prompt` 会改变分段与标点**，不只是纠术语——同一音频加了它从 681 段碎句变 662 段整句带标点。它是影响验收判据的强参数，必须随基线一起记录。
 
 ## 内存约束（第一约束，不是 CPU 也不是显存）
 

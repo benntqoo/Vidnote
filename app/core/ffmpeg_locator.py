@@ -10,6 +10,14 @@
 **明确排除** `%LOCALAPPDATA%/ms-playwright/` —— 那里的 ffmpeg 是
 `--disable-everything` 构建，只编进了 mjpeg/vp8 与 image2/matroska，
 **没有 mp4 demuxer**，用它抽音频必然失败。
+
+**还有一个必须踩过的坑：WinGet 的 `Links/` 目录不能直接用。**
+WinGet 会把 `%LOCALAPPDATA%/Microsoft/WinGet/Links/ffmpeg.exe` 放进 PATH，
+但那是一个 **0 字节的占位文件**（app execution alias），既不是 symlink 也不是
+reparse point，`shutil.which()` 会命中它，而 `subprocess` 调它会直接抛
+`OSError: [WinError 193] 不是有效的 Win32 应用程序`。
+所以候选必须做**有效性校验**（非空 + PE 头 `MZ`），无效就继续往下找；
+真实可执行在 `WinGet/Packages/Gyan.FFmpeg_*/ffmpeg-*/bin/`。
 """
 
 from __future__ import annotations
@@ -32,8 +40,27 @@ def _is_blocked(path: Path) -> bool:
     return any(part in lowered for part in _BLOCKED_PARTS)
 
 
+def _is_usable_executable(path: Path) -> bool:
+    """判断候选是不是**真的能执行**。
+
+    三条校验缺一不可：
+
+    1. 存在；
+    2. 非空 —— WinGet `Links/` 里的占位文件大小为 0，`is_file()` 仍为 True；
+    3. 有 PE 头 —— Windows 可执行文件以 `MZ` 开头。这能一次挡掉占位文件、
+       被截断的下载、以及误指向 `.cmd`/`.bat`/目录的情况。
+    """
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        with path.open("rb") as fh:
+            return fh.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
 def _winget_candidates() -> list[Path]:
-    """WinGet 安装目录下的候选 ffmpeg。"""
+    """WinGet 安装目录下的候选 ffmpeg（真实路径，不是 Links 转发目录）。"""
     local = os.environ.get("LOCALAPPDATA")
     if not local:
         return []
@@ -51,19 +78,19 @@ def _locate_cached(explicit: str | None) -> Path | None:
     # ① 配置里显式指定的路径
     if explicit:
         candidate = Path(explicit).expanduser()
-        if candidate.is_file() and not _is_blocked(candidate):
+        if _is_usable_executable(candidate) and not _is_blocked(candidate):
             return candidate
 
-    # ② PATH
+    # ② PATH —— 命中的可能是 WinGet Links 的 0 字节占位文件，校验后再用
     which = shutil.which("ffmpeg")
     if which:
         candidate = Path(which)
-        if not _is_blocked(candidate):
+        if _is_usable_executable(candidate) and not _is_blocked(candidate):
             return candidate
 
-    # ③ WinGet
+    # ③ WinGet 真实安装目录
     for candidate in _winget_candidates():
-        if candidate.is_file():
+        if _is_usable_executable(candidate):
             return candidate
 
     # ④ 放弃
@@ -95,6 +122,7 @@ def describe(explicit: str | None = None) -> str:
         return "未找到"
     if explicit and Path(explicit).expanduser() == found:
         return f"{found}（来自 config）"
-    if _is_blocked(found):
-        return f"{found}（⚠️ 来自 playwright，不可用）"
-    return str(found)
+    which = shutil.which("ffmpeg")
+    if which and Path(which) == found:
+        return f"{found}（来自 PATH）"
+    return f"{found}（来自 WinGet Packages）"
