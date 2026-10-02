@@ -1,0 +1,32 @@
+# Vidnote — Python 依赖
+# 实测通过的版本以 # verified 标注；= 后为该版本在本机的实测值。
+# 安装（本机托管环境）：
+#   C:/Users/Ben/.workbuddy/binaries/python/envs/default/Scripts/pip.exe install -r requirements.txt
+
+# ---- 转写核心 ----
+faster-whisper>=1.2.1        # verified 1.2.1
+ctranslate2>=4.8.2           # verified 4.8.2（随 faster-whisper 装）
+numpy>=2.0                   # 用于直读 wav，绕开 PyAV
+
+# ---- 抽帧 / 图像处理 ----
+Pillow>=10.0
+
+# ---- 配置 ----
+PyYAML>=6.0
+
+# ---- 阶段 3：GUI ----
+# PySide6>=6.7
+
+# ---- GPU 推理运行时（Windows 必需，DLL 不在 PATH 上）----
+# 注意：PyPI 直连会卡死，必须用国内镜像且禁用代理：
+#   pip install -i https://mirrors.cloud.tencent.com/pypi/simple --proxy "" \
+#       nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-nvrtc-cu12
+# 本机已装：cublas 12.9.2.10 / cudnn 9.27.0.42 / nvrtc 12.9.86
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12
+# nvidia-cuda-nvrtc-cu12
+
+# ---- 以下为外部二进制，不走 pip ----
+# ffmpeg         → winget install --id Gyan.FFmpeg -e
+# yt-dlp         → 本机在 C:/Users/Ben/.agent-reach-venv/Scripts/yt-dlp
+# playwright-cli → npm i -g @playwright/cli（仅取 cookie 用）

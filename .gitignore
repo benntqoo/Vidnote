@@ -1,0 +1,68 @@
+# Vidnote — 忽略规则
+
+# ---- 用户配置（可能含密钥；密钥本身走环境变量，但路径是本机专属）----
+config.yaml
+
+# ---- 运行时数据 ----
+state.db
+state.db-journal
+work/
+output/
+logs/
+*.log
+
+# ---- 模型权重（2.87 GB，走下载不进仓库，见 README）----
+# 注意：必须写 models/* 而不是 models/
+# 目录级忽略（models/）会让 git 不进入该目录，导致后面的 !models/.gitkeep 失效
+models/*
+!models/.gitkeep
+
+# ---- 中间产物 ----
+*.wav
+*.mp4
+*.mkv
+*.mov
+*.part
+*.ytdl
+cookies.txt
+state.json
+scene_log.txt
+
+# samples/ 下的基线**默认纳入版本控制**——
+# 2026-10-02 因本仓库为 GitHub 公开仓库而撤销此策略，见文件末尾「第三方素材」一节。
+# 基线仍留在本地磁盘（阶段 1 验收依赖它），只是不进版本库。
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 打包产物 ----
+build/
+dist/
+*.spec
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# ---- 本机 Agent 工作数据（会话记忆、本地任务记录）----
+# 若要让它进版本库，删掉下面这行即可
+.workbuddy/
+
+# ---- 测试材料与第三方素材（不纳入版本库）----
+# samples/ 下的一切都是测试材料，且派生自第三方视频（画面 / 音频 / 转写文本）。
+# 保留在本地磁盘供阶段 1 验收使用，但不进公开仓库。详见 samples/README.md。
+samples/*
+# 例外：只保留 samples/ 下的说明文档
+!samples/README.md
+
+# 产出形态参考取自同一段第三方视频，仅本地留存
+docs/样例产出_参考.md

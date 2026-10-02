@@ -1,0 +1,52 @@
+# Vidnote 配置模板
+# 使用方式：cp config.example.yaml config.yaml 然后按需修改。
+# config.yaml 已在 .gitignore 中，不会误提交。
+# 字段语义与默认值依据见 PLAN.md §5。
+
+paths:
+  # 工作根目录：每条视频一个子目录。必须在 D 盘（C 盘仅剩 150GB，D 盘 988GB）
+  work_dir: "D:/Code/SideProject/Vidnote/work"
+  model_dir: "D:/Code/SideProject/Vidnote/models"
+  # 留空则按 PLAN.md §9.4 的顺序自动定位；显式指定可跳过搜索
+  # 本机实测有效值：
+  ffmpeg: null
+
+runtime:
+  device: "auto"            # auto | cuda | cpu。auto 会实测一次推理来判断 CUDA 是否真可用
+  compute_type: "auto"      # auto → cuda:float16 / cpu:int8
+  model: "large-v3"         # large-v3 | medium | small
+  auto_concurrency: true    # true 则用 PLAN.md §3.2 的公式动态计算
+  # 以下仅在 auto_concurrency: false 时生效（本机实测预期取值）
+  max_download: 8
+  max_frame: 4
+  max_summarize: 4
+
+transcribe:
+  language: "zh"
+  beam_size: 5
+  vad_filter: true
+  # 领域术语提示词能明显降低同音误识（实测：财经术语误识率高）
+  initial_prompt: ""
+
+frames:
+  enabled: false            # 默认关。实测多数口播视频画面无独立信息量（见 docs/实测记录.md）
+  scene_threshold: 0.3
+  max_frames: 400
+  sheet_cols: 6
+  sheet_rows: 4
+
+summarize:
+  enabled: false            # true 才调用 API；默认关闭以保证离线可用
+  base_url: "https://api.openai.com/v1"
+  # 密钥不进本文件，走环境变量
+  api_key_env: "VIDNOTE_API_KEY"
+  model: "gpt-4o"
+  template: "摘要+章节大纲+要点"
+
+cookie:
+  browser: "chromium"       # playwright 取 cookie 用的浏览器
+  auto_refresh: true        # 检测到失效则自动重取（ttwid 约 24 小时过期）
+
+download:
+  rate_limit_per_min: 10    # 防平台风控。实测抖音对短时间大量请求敏感
+  keep_intermediate: true   # false 则任务完成后删除视频/音频，只留转写稿

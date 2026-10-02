@@ -1,0 +1,23 @@
+# Vidnote — 属性规则
+# 目的：保证 samples/ 下的回归基线跨机器、跨检出一致。
+# 阶段 1 的验收判据是「产出与 samples/transcript_gpu.txt 逐字符严格相等」，
+# 任何换行符转换都会直接污染这条基线。
+
+# 默认：由 git 自动判断是否文本，仓库内统一 LF
+* text=auto eol=lf
+
+# ★ 回归基线：按原始字节存取，禁止任何换行转换
+#   （transcript_*.txt / *.srt / *.json / frames_index.json 都在此范围内）
+samples/** -text
+
+# 二进制文件：不做文本处理，不参与 diff
+*.mp4  -text -diff
+*.jpg  -text -diff
+*.jpeg -text -diff
+*.png  -text -diff
+*.bin  -text -diff
+*.wav  -text -diff
+
+# 注意：本项目未启用 git-lfs。
+# 45 MB 的 samples/video.mp4 走普通提交（低于 GitHub 100 MB 单文件上限）。
+# 若将来基线视频变大，再改为 filter=lfs 并同步 .gitignore 与文档。
