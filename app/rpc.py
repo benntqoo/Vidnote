@@ -227,9 +227,26 @@ class Worker:
         return 0
 
     def _install_logging(self) -> None:
+        """日志**只走协议一条路**（`log` 事件），默认不镜像到 stderr。
+
+        为什么默认关掉镜像：root logger 若同时挂 stderr handler 与协议 handler，
+        每条记录都会到达 Rust 侧两次 —— 一次是带正确 level 的结构化 `log` 事件，
+        一次是被 Rust 标成 `debug` 的 stderr 原文。日志区会整体重复一遍，
+        且第二份的级别是错的。
+
+        `VIDNOTE_LOG_STDERR=1` 可打开镜像，便于在不开 UI 的情况下直接看 worker 输出。
+        未捕获异常的 traceback 不受影响 —— 那由解释器的 excepthook 直接写 stderr。
+        """
         root = logging.getLogger()
         root.setLevel(logging.INFO)
-        if not any(
+
+        want_stderr = os.environ.get("VIDNOTE_LOG_STDERR", "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "no",
+        )
+        if want_stderr and not any(
             isinstance(h, logging.StreamHandler) and not isinstance(h, _ProtocolLogHandler)
             for h in root.handlers
         ):
@@ -238,7 +255,10 @@ class Worker:
                 logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
             )
             root.addHandler(stderr_handler)
-        root.addHandler(_ProtocolLogHandler(self.proto))
+
+        # 幂等：重复调用不得叠加多个协议 handler（否则同样会重复上报）
+        if not any(isinstance(h, _ProtocolLogHandler) for h in root.handlers):
+            root.addHandler(_ProtocolLogHandler(self.proto))
 
     def _bootstrap(self) -> None:
         """进程启动时的必要修复。**必须在处理任何命令前执行。**"""

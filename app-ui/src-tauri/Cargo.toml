@@ -1,0 +1,94 @@
+[package]
+name = "app-ui"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "app_ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# 见下方 `[dependencies]` 里那段说明。**两处都要写**，不能合并：
+# 构建依赖走的是 host 侧 feature 解析组，与普通依赖组互不合并，
+# 只在 `[dependencies]` 里开 `std` 修不到构建依赖那条路上的 indexmap。
+indexmap = { version = "1.9", features = ["std"] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── 为什么这里要显式依赖一个「本 crate 用不到」的 indexmap ──────────────────────
+# 症状：`schemars 0.8.x` 编译报 E0107「expected 3 generic arguments」，指向它自己的
+#      `pub type Map<K, V> = indexmap::IndexMap<K, V>;`。
+#
+# 因果链（已逐环节实证，完整诊断记录见 docs/阶段3_打通记录.md §2）：
+#   1. `tauri-utils` 打开了 schemars 的 `preserve_order` feature → schemars 用
+#      `indexmap::IndexMap<K, V>`（两个泛型参数）。
+#   2. schemars 声明的是 `indexmap = { version = "1.2", features = ["serde-1"] }`
+#      ——`serde-1` 只是 `["serde"]`，**不含 `std`**；而 indexmap 1.9.3 的
+#      `[features]` 里**压根没有 `default` 兜底**，于是编译 indexmap 时
+#      `CARGO_FEATURE_STD` 不是「已设置」。
+#   3. indexmap 1.9.3 的 `build.rs` 因此走 fallback 分支，用 `autocfg` **实际调用
+#      rustc 探测** sysroot 里有没有 `std` crate，来 emit 那个 `has_std` cfg。
+#   4. `IndexMap<K, V, S = RandomState>` 这个**默认类型参数只在 `#[cfg(has_std)]`
+#      下存在**（src/map.rs:70-76）。探测一失败 → 没有默认 `S` → 第 1 步的 2 参写法
+#      就变成「expected 3 generic arguments」。
+#
+# 本机探测失败的直接证据（`autocfg::probe_raw` 返回值）：
+#      `ERR 所有的管道范例都在使用中。 (os error 231 / ERROR_PIPE_BUSY)`
+# 即探测在**创建捕获 stdout 的匿名管道**时就挂了，跟 MSVC / 工具链无关。
+#
+# 修法：不在「让探测成功」上纠缠，而是**把探测彻底绕开**——显式打开 indexmap 的
+# `std` feature。这会让 cargo 为它设置 `CARGO_FEATURE_STD`，于是 `build.rs` 走进
+# `Some(_) => autocfg::emit("has_std")` 分支，**一次 rustc 都不再 spawn**。
+# 这也正是 indexmap `build.rs` 注释所写的预期用法：
+#      "If 'std' is explicitly requested, don't bother probing the target for it."
+#
+# 附带收益：`autocfg` 在整个依赖图里**只有 indexmap 1.9.3 一个使用者**（`cargo tree
+# -i autocfg` 已验），所以这一处修完，编译期就再没有「运行时探测 rustc」这个
+# 不确定性来源——构建结果不再取决于执行环境能不能成功 spawn 子进程。
+#
+# 注意：本表单**没有** `default-features = false`——indexmap 1.9.3 的 `[features]`
+# 里不存在 `default` 键，写不写都一样，写了反而误导后来人以为有过默认特性。
+#
+# 依赖是「未使用」的：本 crate 不 import 它，只借它触发 feature 统一（unification）。
+# 若将来 indexmap 升到 2.x，或 schemars 开始自己带 `std`，这段可以整体删除。
+indexmap = { version = "1.9", features = ["std"] }
+
+# Job Object：父进程消失时连带终止 Python sidecar（规格 §7）。
+# 只用 windows-sys 这层纯 Rust 绑定——它不编译任何 C 代码，
+# 因此不依赖本机 MSVC 的 C 头文件是否完整。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    # Job Objects 是分层 gated 的，光有 `Win32_System_JobObjects` 不够：
+    #   CreateJobObjectW                     → 需要 Win32_Security
+    #     （它签名里带 `*const SECURITY_ATTRIBUTES`，所以被归到 Security 组）
+    #   JOBOBJECT_EXTENDED_LIMIT_INFORMATION → 需要 Win32_System_Threading
+    #     （结构体里内嵌 `JOBOBJECT_BASIC_LIMIT_INFORMATION`，而后者归 Threading 组）
+    # 漏了这两个，症状是 E0432「no `CreateJobObjectW` in `Win32::System::JobObjects`」
+    # 加一句含糊的「found an item that was configured out」——很不容易反推回 feature 缺失。
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

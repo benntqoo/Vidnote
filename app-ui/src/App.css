@@ -1,0 +1,434 @@
+/* 全局样式。桌面应用形态：顶部工具条 + 状态栏 + 任务表 + 底部日志区。
+   竖排布局，只有任务表滚动，日志区固定高度 —— 长跑时表头与工具条不该消失。 */
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f0f1f4;
+  --border: #dcdee3;
+  --text: #1c1f24;
+  --text-dim: #6b7280;
+  --accent: #2f6fed;
+  --ok: #17a34a;
+  --warn: #d97706;
+  --error: #dc2626;
+
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", Inter, "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+.muted {
+  color: var(--text-dim);
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
+
+.divider {
+  width: 1px;
+  align-self: stretch;
+  margin: 0 4px;
+  background: var(--border);
+}
+
+/* ------------------------------------------------------------------ 布局 */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin-right: 4px;
+}
+
+/* -------------------------------------------------------------- 按钮 */
+
+button {
+  font: inherit;
+  padding: 4px 12px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+button.primary:hover:not(:disabled) {
+  background: #2760d4;
+}
+
+button.mini {
+  padding: 1px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+}
+
+button.danger {
+  color: var(--error);
+  border-color: #f3c2c2;
+}
+
+button.danger:hover:not(:disabled) {
+  background: #fdf2f2;
+}
+
+/* ---------------------------------------------------------- 状态栏 */
+
+.statusbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+.chip .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.chip-muted {
+  color: var(--text-dim);
+}
+.chip-active {
+  color: var(--accent);
+  border-color: #c3d6fb;
+  background: #f1f6ff;
+}
+.chip-ok {
+  color: var(--ok);
+  border-color: #bfe6cd;
+  background: #f2fbf5;
+}
+.chip-warn {
+  color: var(--warn);
+  border-color: #f2dcb8;
+  background: #fffaf0;
+}
+.chip-error {
+  color: var(--error);
+  border-color: #f3c2c2;
+  background: #fdf3f3;
+}
+
+.statusbar-detail {
+  font-size: 12px;
+  color: var(--error);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45%;
+}
+
+/* --------------------------------------------------------- 任务表 */
+
+.empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 32px;
+  text-align: center;
+  color: var(--text);
+}
+
+.table-wrap {
+  flex: 1 1 auto;
+  overflow: auto;
+  background: var(--surface);
+}
+
+table.tasks {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+table.tasks th,
+table.tasks td {
+  padding: 5px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+table.tasks thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--surface-2);
+}
+
+table.tasks tbody tr:hover {
+  background: #fafbfd;
+}
+
+/* 行左侧色条：状态一眼可辨，但不像整行染色那样刺眼 */
+table.tasks tbody tr td:first-child {
+  border-left: 3px solid transparent;
+}
+tr.row-active td:first-child {
+  border-left-color: var(--accent);
+}
+tr.row-ok td:first-child {
+  border-left-color: var(--ok);
+}
+tr.row-error td:first-child {
+  border-left-color: var(--error);
+}
+tr.row-warn td:first-child {
+  border-left-color: var(--warn);
+}
+
+.col-id {
+  width: 48px;
+  color: var(--text-dim);
+}
+.col-title {
+  width: auto;
+}
+.col-dur,
+.col-elapsed {
+  width: 72px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.col-status {
+  width: 92px;
+}
+.col-progress {
+  width: 132px;
+}
+.col-note {
+  width: 190px;
+}
+.col-actions {
+  width: 168px;
+}
+
+.err-text {
+  color: var(--error);
+}
+
+.row-actions {
+  display: flex;
+  gap: 4px;
+}
+
+/* 进度条。`.indeterminate` 用于「进行中但进度不可知」——
+   绝不要渲染成 0%，那会让人以为卡住了（规格 §5）。 */
+.progress {
+  position: relative;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.progress .bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.progress-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  mix-blend-mode: luminosity;
+}
+
+.progress.indeterminate .bar {
+  width: 35%;
+  animation: slide 1.2s ease-in-out infinite;
+}
+
+@keyframes slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+/* ------------------------------------------------------- 日志区 */
+
+.logpanel {
+  flex: 0 0 168px;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.logpanel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+
+.logpanel-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 4px 12px 8px;
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.logline {
+  display: flex;
+  gap: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-level {
+  flex: 0 0 48px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+.log-src {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+
+.log-debug .log-msg {
+  color: var(--text-dim);
+}
+.log-warning .log-msg {
+  color: var(--warn);
+}
+.log-error .log-msg {
+  color: var(--error);
+}
+
+/* --------------------------------------------------------- 添加链接 */
+
+.addtasks {
+  flex: 1 1 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.addtasks textarea {
+  font: inherit;
+  padding: 6px 8px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  resize: vertical;
+}
+
+.addtasks textarea:focus,
+button:focus-visible {
+  outline: 2px solid #b9cdfa;
+  outline-offset: 1px;
+}
+
+.addtasks-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}

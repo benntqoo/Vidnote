@@ -55,6 +55,12 @@ app-ui/node_modules/
 app-ui/dist/
 # 注意：Cargo.lock 对「应用」（非库）应当入库以锁定依赖版本，故此处不忽略
 
+# 本机专用的 MSVC workaround（本机 VS 2022 缺 include，详见该文件顶部注释）。
+# ⚠️ 这一条会**连合法的 .cargo/config.toml 一起忽略**。将来若需要提交一个
+# 真正的 cargo 配置，请加一行 `!app-ui/src-tauri/.cargo/config.toml` 精确放行，
+# 不要直接删掉本行 —— 否则别人 clone 后会拿到一条指向本机 VS 路径的配置。
+app-ui/src-tauri/.cargo/config.toml
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/
