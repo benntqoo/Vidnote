@@ -205,9 +205,15 @@ Vidnote/                                  # 仓库根
 │   │   └── config.py                     #   ✓已完成  配置读写（dataclass + yaml）
 │   ├── cli.py                            #   ✓已完成  人用入口 + 阶段 1 验收入口
 │   └── rpc.py                            #   ✓协议层已完成  ★Rust 宿主入口（sidecar 常驻 worker）
-├── app-ui/                               # ★Rust + Tauri 工程（阶段 3）
+├── app-ui/                               # ✓已完成  Rust + Tauri 工程（阶段 3）
 │   ├── src-tauri/                        #   Rust 宿主：进程监督器 + 事件分发
-│   └── src/                              #   前端：任务表格 / 进度 / 日志
+│   │   ├── src/worker/protocol.rs        #     信封编解码（对应 IPC 规格 §2）
+│   │   ├── src/worker/locator.rs         #     Python 解释器与工作目录定位
+│   │   ├── src/worker/jobobject.rs       #     Win32 Job Object（父死子死，防孤儿）
+│   │   ├── src/worker/mod.rs             #     监督器：spawn / 心跳 / 事件分发
+│   │   ├── src/commands.rs               #     Tauri 命令：worker_state / send / shutdown
+│   │   └── .cargo/config.toml            #     ⚠本机专用：钉死完整 MSVC 工具链（.gitignore）
+│   └── src/                              #   前端：任务表格 / 进度 / 日志（React 19 + TS + Vite）
 ├── prototypes/                           # ★已验证原型，阶段 1 重构的直接输入
 │   ├── transcribe.py  state2cookie.py  make_sheets.py
 │   └── README.md                         #   对应关系、环境假设、不可丢的实现细节
@@ -219,7 +225,9 @@ Vidnote/                                  # 仓库根
 ├── models/large-v3/                      # Whisper large-v3（2.87 GB，已就位）
 ├── samples/                              # ★回归测试基线（本地留存，不入 git，见 samples/README.md）
 ├── docs/
-│   └── 实测记录.md                        #   本机性能实测与环境快照（事实源）
+│   ├── 实测记录.md                        #   本机性能实测与环境快照（事实源）
+│   ├── IPC协议规格.md                     #   Rust ↔ Python 契约（v1.1，§9 共 19 条判据）
+│   └── 阶段3_打通记录.md                  #   阶段 3 三个阻塞的因果链与排错手法（2026-10-03）
 ├── config.example.yaml                   # 配置模板（复制为 config.yaml）
 ├── config.yaml                           # 用户配置（.gitignore 已排除）
 ├── state.db                              # 任务状态（自动生成）
@@ -230,6 +238,10 @@ Vidnote/                                  # 仓库根
 
 **迁移已完成的部分**：`app/` 目录已建好空骨架，`prototypes/` `models/` `samples/` `docs/` 内容就位。
 阶段 1 只需往 `app/core/` 里填实现，**不需要再动目录结构**。
+
+> **状态更新（2026-10-03）**：阶段 1-3 均已落地。`app/core/` 与 `app/rpc.py` 为 ✓；
+> `app-ui/` 已从占位变为可运行工程。**`app/ui/`（Python 侧 UI 占位）已随 `app-ui/` 的落地移除**
+> ——原计划把 UI 写在 Python 侧，改用 Rust 后该目录再无用途（全仓库无任何引用）。
 
 ### 4.1 各模块接口契约
 
@@ -432,7 +444,13 @@ pending ──▶ downloading ──▶ downloaded ──▶ transcribing ──
 且「支持 1900+ 平台」的同类工具本身就是 yt-dlp 套壳。Rust 侧同样只能 subprocess 调它。
 
 **代价（已知并接受）**：
-- 本机 `rustc` / `cargo` / `rustup` **均未安装**，需先装 Rust 工具链 + MSVC build tools
+- ~~本机 `rustc` / `cargo` / `rustup` **均未安装**，需先装 Rust 工具链 + MSVC build tools~~
+  → **更正（2026-10-03）**：三者**早已安装**（`C:\Users\Ben\.rustup` + `.cargo`，合计 1.56 GB，
+  rustc/cargo 1.90.0）。此前判为"未安装"是 **PATH 未配**导致的误判——`which rustc` 失败 ≠ 未安装。
+  真正缺的只有 PATH 与 `rust-analyzer` 组件。MSVC 另有坑：本机 VS 2022 的
+  MSVC **14.44.35207 缺 `include` 目录**（安装被裁剪），cc-rs 按「版本更新优先」恰选中它，
+  导致任何编译 C/C++ 的 crate 失败；已用项目级 `.cargo/config.toml` 钉死完整的
+  VS 2019 BuildTools（14.29.30133）绕过
 - 分发包 = Tauri 安装包 + PyInstaller 目录（**两层打包**，见 §8 阶段 5）
 - 内存与启动收益仅**部分**——Python 进程的运行时开销并未消除
 
@@ -552,12 +570,41 @@ URL_PATTERNS = {
 | 阶段 1 回归（`run samples/video.mp4 --force`） | 逐字节 | 批量路径下的产出与 v2 基线 txt/srt/json **三格式逐字节一致**（24547 / 44299 / 70249 字节，662 段） |
 
 
-### 阶段 3：GUI（Rust + Tauri）
+### 阶段 3：GUI（Rust + Tauri）—— 核心闭环已打通（2026-10-03）
 
 - 目标：双击启动，粘贴链接，点开始，看进度，完成后能打开目录
 - 交付：`app-ui/`（Tauri 工程：`src-tauri/` 宿主 + `src/` 前端）+ `app/rpc.py` 完整实现
-- 前置：Rust 工具链 + MSVC build tools（本机未安装，需先补）
-- 验收：见 §10 验收清单，**外加** `docs/IPC协议规格.md` §9 的全部 8 条协议判据
+- 前置：~~Rust 工具链 + MSVC build tools（本机未安装，需先补）~~ → **已完成**。
+  Rust 1.90.0 早已在 C 盘默认位置（真正缺的是 PATH + `rust-analyzer` 组件）；
+  Tauri 四个硬前置（rustc/cargo、MSVC 链接器、Windows SDK、WebView2 Runtime）经实测全部满足
+- 验收：见 §10 验收清单，**外加** `docs/IPC协议规格.md` §9 的**全部 19 条**协议判据
+  （原文写"8 条"是旧数，见 §8 / §11.7 / §12.2 三处；`tools/rpc_smoke.py` 实跑 **19/19**）
+
+**已完成（核心闭环）**：编译 → 单测 → 前端类型检查 → 协议 → 端到端，全链路实跑。
+
+| 判据 | 命令 | 实测 |
+|---|---|---|
+| 编译 | `cargo build` | ✅ 32.15 s，**0 warning** |
+| 单测 | `cargo test --lib` | ✅ **6 passed / 0 failed** |
+| 前端 | `tsc` | ✅ 0 错误（26 模块） |
+| 协议 | `python tools/rpc_smoke.py` | ✅ 19/19 |
+| 端到端 | `npm run tauri dev` | ✅ `spawn → starting → ready(gpu_verified=false) → env_verified(true)` |
+| 无孤儿 | 进程树 + 热重载 | ✅ `app-ui.exe → python.exe(worker) → python.exe(CUDA 验证)`，旧实例连带消失 |
+
+关键设计点：`ready` **先回快速判据**（不加载模型、不阻塞 UI，`gpu_verified:false`），
+异步 CUDA 验证完成后再推 `env_verified` 把 `gpu_verified` 翻成 `true`（依据 `docs/IPC协议规格.md` §4.2）。
+
+**阶段 3 仍未完成**：
+- **界面是否真的渲染出这些状态 —— 只从 Rust 侧确认事件已 `emit`，未做视觉确认**
+- §7 的**崩溃自动重启**未实现（目前只如实上报，错误文案已写明未自动重启）
+- 打包配置 `bundle.externalBin`、托盘、右键菜单、关闭确认——均为后续项
+- 优雅关闭的 30 s 窗口当前实际拿不到（窗口一关应用即退出，Job Object 会收掉 worker）
+
+> 三个阻塞（indexmap 索引探测不稳定、MSVC 残缺、**Job Object 句柄提前 drop**）的完整因果链
+> 见 **`docs/阶段3_打通记录.md`**。其中 Job Object 那条是**真实代码缺陷，非环境问题**：
+> `let _job = bind_child(&child)` 让防孤儿的句柄在 `spawn_worker` 返回时即被 drop，
+> 而 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 语义是「关闭作业最后一个句柄 = 终止作业内所有进程」
+> ——**保护机制亲手杀掉了刚启动的 worker**。
 
 ### 阶段 4：cookie 自动化 + 汇总模块
 
@@ -730,9 +777,18 @@ add_nvidia_dll_dirs()
 4. **汇总模块的 token 成本**：一条 20 分钟视频转写稿约 8000–10000 字，是否超出所选模型的上下文、单条成本多少，**未测**。
 5. **两层打包**：PyInstaller（ctranslate2 + CUDA DLL，DLL 需随包分发）+ Tauri bundler，**未验证**，复杂度高于原单层方案。
 6. **GPU 并发是否真的无收益**：§3.1 断言"GPU 转写开 2 个实例不会提升吞吐"，这是基于显存与算力分时复用的推断，**未实测**。若要验证，可本地跑双实例对照——但如果阶段 2 验收达标，就没有必要验证。
-7. **Rust UI 与 IPC 协议**：`docs/IPC协议规格.md` 是 2026-10-02 新设计的契约，**未经端到端实测**。
-   其协议层验收判据（该文档 §9，共 8 条）可用 Python mock client 独立跑通，**不必等 Rust 工程建起来**——建议在阶段 1 收尾前先跑一遍。
-8. **Rust 侧产出未验证的自有风险**：本机 `rustc`/`cargo` 未安装，`app-ui/` 尚未创建。Tauri 的 sidecar 机制、Windows Job Object 进程回收、WebView2 依赖分发性，均**未在本机验证**。
+7. ~~**Rust UI 与 IPC 协议**：`docs/IPC协议规格.md` 是 2026-10-02 新设计的契约，**未经端到端实测**。
+   其协议层验收判据（该文档 §9，共 8 条）可用 Python mock client 独立跑通。~~
+   → **已验证（2026-10-03）**。协议层 `tools/rpc_smoke.py` 实跑 **19/19**（原文"8 条"是旧数），
+   并已**真的端到端跑通**（Rust 宿主 spawn Python → 握手 → 事件回推 → 界面）。
+   **遗留**：判据 6 的心跳只测了**空闲态**往返（0 ms），**不能**据此断言"转写进行中心跳仍通"——
+   转写是否阻塞主循环仍是「UI 假死」的未覆盖面，见 `docs/IPC协议规格.md` §9 末尾标注。
+8. ~~**Rust 侧产出未验证的自有风险**：本机 `rustc`/`cargo` 未安装，`app-ui/` 尚未创建。
+   Tauri 的 sidecar 机制、Windows Job Object 进程回收、WebView2 依赖分发性，均**未在本机验证**。~~
+   → **已大幅收敛（2026-10-03）**。`app-ui/` 已建成并可运行；Tauri sidecar 机制与
+   Windows Job Object 进程回收均**已在本机实测**（进程树无孤儿，热重载后旧实例连带 worker 消失）。
+   **仍未验证**：① **分发形态**——WebView2 依赖分发性、PyInstaller + Tauri 两层打包（见 §11.5）；
+   ② **界面渲染**（只确认事件已 emit，未做视觉确认）。
 9. **基线参数记录规范**（2026-10-03 建立）。v1 基线因 `initial_prompt` 未落盘而作废，
    已重建 v2 并附完整参数快照（`samples/README.md`）。**后续任何基线更新都必须同时更新快照表**，
    否则重复 v1 的错误。已实测：实现与原型脚本同参数下逐字节一致、多次重跑逐字节一致，
@@ -752,18 +808,26 @@ add_nvidia_dll_dirs()
 
 ### 12.2 推进顺序
 
-按 `§8` 顺序走，**不要跳阶段**。当前处于**阶段 3（GUI：Rust + Tauri）**。
+按 `§8` 顺序走，**不要跳阶段**。当前处于**阶段 3（GUI：Rust + Tauri）**，
+**核心闭环已打通**，剩余为交互细节与分发形态。
 
-阶段 1（核心流水线）与阶段 2（并发调度 + 断点续跑）均已完成并验收通过，
-Python 功能层已是「可直接被 Rust 宿主驱动」的形态（`app/rpc.py` + `docs/IPC协议规格.md` v1.1）。
+阶段 1（核心流水线）与阶段 2（并发调度 + 断点续跑）均已完成并验收通过。
+阶段 3 的**编译与启动壁垒已清除**：`app-ui/` 已建成，Rust 宿主成功常驻 spawn `app/rpc.py`，
+握手与事件回推端到端跑通（详见 §8 阶段 3 与 `docs/阶段3_打通记录.md`）。
 
-阶段 3 的**唯一前置阻塞**是工具链：本机 `rustc` / `cargo` 未安装，`app-ui/` 尚未创建。
-需要先补 `winget install Rustlang.Rustup` + VS Build Tools（MSVC），然后：
+工具链前置早已满足（此前"rustc 未安装"是 PATH 误判）。原计划的四步现状：
 
-1. 建 `app-ui/`（Tauri 2.x 工程），`src-tauri/` 里配 `bundle.externalBin` 指向 Python sidecar
-2. Rust 侧实现进程监督器：spawn worker → 握手 → 事件分发 → Job Object 回收（§7）
-3. 前端实现任务表格 / 进度 / 日志（§7.2）
-4. 验收：§10 清单 + `docs/IPC协议规格.md` §9 的全部 8 条协议判据
+1. ~~建 `app-ui/`（Tauri 2.x 工程）~~ ✅ React 19 + TS 6 + Vite 8；`bundle.externalBin` **尚未配**
+2. ~~Rust 侧实现进程监督器~~ ✅ spawn → 握手 → 事件分发 → Job Object 回收（防孤儿已实测）
+3. ~~前端实现任务表格 / 进度 / 日志~~ ✅ 组件已写、`tsc` 零错误；**渲染效果未做视觉确认**
+4. 验收：§10 清单 + `docs/IPC协议规格.md` §9 的**全部 19 条**协议判据（已 **19/19**）
+
+**下一步（按价值排序）**：
+- **视觉确认**界面是否真的把 worker 状态与任务进度渲染出来——唯一未验证的核心闭环环节
+- 关闭确认弹窗（同时兑现 §7 的优雅关闭 30 s 窗口）
+- 托盘 + 右键菜单
+- §7 的崩溃自动重启
+- 阶段 3 末期做一次「PyInstaller 打包 + Tauri sidecar」的最小验证（`bundle.externalBin`）
 
 > 建议在阶段 3 末期就做一次「PyInstaller 打包 + Tauri sidecar」的最小验证，
 > 不要拖到阶段 5——那两层打包叠加的风险是 §11 里最高的一条。
@@ -782,5 +846,10 @@ Python 功能层已是「可直接被 Rust 宿主驱动」的形态（`app/rpc.p
 | CUDA 运行时 | ✅ cublas 12.9.2.10 / cudnn 9.27.0.42 / nvrtc 12.9.86 |
 | large-v3 模型 | ✅ `models/large-v3/`（2.87 GB） |
 | **GPU 转写** | ✅ **实测可用，8.7× 实时** |
+| rustc / cargo | ✅ 1.90.0（`C:\Users\Ben\.cargo\bin`，2026-10-03 补入用户级 PATH） |
+| MSVC 工具链 | ✅ VS 2019 BuildTools MSVC **14.29.30133**（⚠ VS 2022 的 14.44.35207 缺 `include`，不可用） |
+| Windows SDK | ✅ 与 2019 BuildTools 配套 |
+| WebView2 Runtime | ✅ 已安装（Tauri 硬前置之一） |
+| Tauri CLI | ⚠️ `cargo install tauri-cli` 曾失败（暴露 MSVC 问题）；改用 npm 的 `@tauri-apps/cli` **2.12.1**，`npm run tauri` 正常工作 |
 
 > 上面这些**已经全部就绪**，程序不需要再装一遍环境——`requirements.txt` 里只列 Python 依赖，CUDA 与模型按"已存在则复用、不存在则引导下载"处理。
