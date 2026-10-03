@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
 from collections import deque
 from pathlib import Path
 from typing import Callable
 
-from app.core.errors import StageError
+from app.core.errors import StageError, TaskCancelled, raise_if_cancelled
 from app.core.ffmpeg_locator import find_ffmpeg
+from app.core.proc import kill_process
 
 #: 目标音频参数——与基线一致，**不可调**。
 SAMPLE_RATE = 16000
@@ -45,6 +47,7 @@ def extract(
     ffmpeg_path: str | None = None,
     total_sec: float | None = None,
     on_progress: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     """抽音频到 `out_path`。
 
@@ -52,6 +55,10 @@ def extract(
     （「进行中但进度不可知」，见 docs/IPC协议规格.md §5）。
 
     抽音频实测 1.44 秒（1204 秒音频），进度条意义有限，但接口保持一致。
+
+    `cancel_event` 被置位时 kill 掉 ffmpeg 并抛 `TaskCancelled`。检查点放在
+    `-progress` 输出行上——ffmpeg 每约 0.5 秒吐一行，所以取消延迟 ≈ 0.5 秒，
+    不需要额外线程。
     """
     src = Path(video)
     if not src.is_file():
@@ -103,6 +110,7 @@ def extract(
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
+            raise_if_cancelled(cancel_event)
             line = line.strip()
             if line.startswith("out_time_us="):
                 raw = line.split("=", 1)[1]
@@ -113,6 +121,9 @@ def extract(
                         _report(on_progress, "audio", ratio)
             elif line == "progress=end":
                 break
+    except TaskCancelled:
+        kill_process(proc)
+        raise
     finally:
         proc.stdout.close()
 

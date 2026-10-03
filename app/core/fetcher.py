@@ -23,13 +23,15 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from app.core.errors import StageError
+from app.core.errors import StageError, TaskCancelled, raise_if_cancelled
 from app.core.ffmpeg_locator import find_ffmpeg
+from app.core.proc import kill_process
 from app.models.config import Config
 from app.models.task import Task
 from app.core.urls import LOCAL_PLATFORM
@@ -136,10 +138,14 @@ def download(
     cfg: Config,
     out_dir: str | Path,
     on_progress: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> DownloadResult:
     """把 `task` 指向的视频取到 `out_dir/video.<ext>`。
 
     `task.platform == "local"` 时走本地文件分支（硬链接优先），否则调 yt-dlp。
+
+    `cancel_event` 只对 yt-dlp 分支有意义：本地分支是硬链接/复制，实测均在
+    1 秒内完成，为它加检查点只会让 `_take_local` 变复杂而无实际收益。
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -147,7 +153,7 @@ def download(
 
     if task.platform == LOCAL_PLATFORM:
         return _take_local(task, out, cfg, on_progress)
-    return _download_remote(task, out, cfg, on_progress)
+    return _download_remote(task, out, cfg, on_progress, cancel_event)
 
 
 def _take_local(
@@ -194,6 +200,7 @@ def _download_remote(
     out: Path,
     cfg: Config,
     on_progress: Callable[[str, float], None] | None,
+    cancel_event: threading.Event | None = None,
 ) -> DownloadResult:
     yt_dlp = find_yt_dlp(cfg.paths.yt_dlp)
 
@@ -245,6 +252,7 @@ def _download_remote(
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
+            raise_if_cancelled(cancel_event)
             line = line.rstrip("\n")
             tail.append(line)
             match = _PROGRESS_RE.search(line)
@@ -256,6 +264,9 @@ def _download_remote(
                 if pct - last_pct >= 0.01 or _PROGRESS_DONE_RE.search(line):
                     last_pct = pct
                     _report(on_progress, "downloading", min(pct, 1.0))
+    except TaskCancelled:
+        kill_process(proc)
+        raise
     finally:
         proc.stdout.close()
         code = proc.wait()

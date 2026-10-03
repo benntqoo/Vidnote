@@ -123,6 +123,17 @@
   所有阶段之间用**有界队列**（默认容量 2）连接，防止下载跑太快把磁盘/内存撑爆。
 ```
 
+**实现要点（2026-10-03 落地，见 `app/core/dispatcher.py`）**：
+
+| 项 | 落地形态 | 理由 |
+|---|---|---|
+| 队列 | 三条：`_pending`（下载池输入）→ `_q_asr` → `_q_frame`，容量 **2** | 背压；下载比转写快一个数量级，不设界会把磁盘写满 |
+| 抽音频 | **不单独设池**，并入转写池 | 实测 1.44 秒 / 1204 秒音频，仅占转写耗时的 1%。为它加一个池 + 往 IPC 协议的 `concurrency` 事件加 `n_audio` 字段，收益 0.6%，不值当 |
+| 内存护栏 | 采样点 = **「准备取新任务」时刻**，不是定时轮询 | 事件驱动。低于 2 GB 时闸门关闭，已在跑的跑完为止，恢复后自动重开 |
+| 进度限流 | 同一任务最快 200 ms 一次，或进度增量 ≥ 1% 提前推 | 与 `docs/IPC协议规格.md` §4.1 同一口径 |
+| 调度可证伪性 | 每次阶段执行记录一条 `StageSpan`（task_id/stage/started/ended） | 只看总耗时**证不了**「阶段重叠」——总耗时短也可能只是每条都短。必须看区间是否重叠 |
+| 失败分级 | `StageError` → 单条 failed；`TaskCancelled` → cancelled（**不计失败**）；`FatalEnvironmentError` → 中止整批，剩余保持 pending | 环境坏了继续跑只会浪费一整夜 |
+
 ### 3.2 并发数计算规则（动态探测，不写死）
 
 程序启动时按下面的顺序算，每个数字都有依据：
@@ -185,7 +196,8 @@ Vidnote/                                  # 仓库根
 │   │   ├── transcriber.py                #   ✓已完成  转写（faster-whisper）← prototypes/transcribe.py
 │   │   ├── frames.py                     #   ✓已完成  抽帧 + 拼版 ← prototypes/make_sheets.py
 │   │   ├── pipeline.py                   #   ✓已完成  单条执行器（cli / rpc / 阶段2 dispatcher 共用）
-│   │   ├── dispatcher.py                 #   阶段 2  流水线调度器（队列 + worker 管理）
+│   │   ├── dispatcher.py                 #   ✓已完成  流水线调度器（三级队列 + 线程池 + 内存护栏）
+│   │   ├── proc.py                       #   ✓已完成  子进程回收（三模块共用；必须 kill 而非 terminate）
 │   │   ├── cookies.py                    #   阶段 4  cookie 获取/缓存/刷新 ← prototypes/state2cookie.py
 │   │   └── summarizer.py                 #   阶段 4  汇总（可选，API 模式）
 │   ├── models/
@@ -200,7 +212,10 @@ Vidnote/                                  # 仓库根
 │   ├── transcribe.py  state2cookie.py  make_sheets.py
 │   └── README.md                         #   对应关系、环境假设、不可丢的实现细节
 ├── tools/
-│   └── probe_env.py                      #   硬件探测（已实跑，可直接并入 app/core/）
+│   ├── probe_env.py                      #   硬件探测（已实跑，可直接并入 app/core/）
+│   ├── rpc_smoke.py                      #   IPC 协议冒烟测试（19 条判据，不依赖 Rust 端）
+│   ├── dispatcher_selftest.py            #   调度器语义自测（53 条判据，假阶段函数，秒级）
+│   └── phase2_acceptance.py              #   阶段 2 正式验收（23 条判据，真跑 GPU）
 ├── models/large-v3/                      # Whisper large-v3（2.87 GB，已就位）
 ├── samples/                              # ★回归测试基线（本地留存，不入 git，见 samples/README.md）
 ├── docs/
@@ -227,7 +242,9 @@ Vidnote/                                  # 仓库根
 | `audio.extract()` | `(video, out_path, ffmpeg_path=None, total_sec=None, on_progress=None)` | `Path`（wav） | ffmpeg 非 0 退出则抛 `StageError` |
 | `transcriber.run()` | `(wav, model_path, out_prefix, *, language, beam_size, ...)` | `TranscriptOutput`(txt/srt/json) | 模型加载失败抛 `FatalEnvironmentError`，**中止整批** |
 | `frames.run()` | `(video, out_dir, *, scene_threshold, ...)` | `FramesResult`（拼版图 + 索引） | 抛 `StageError`，调用方决定降级 |
-| `pipeline.run_one()` | `(task, cfg, store, *, on_progress=None, on_stage=None)` | `Task`（状态已更新） | 捕获单条错误并写库；环境级故障继续上抛 |
+| `pipeline.run_one()` | `(task, cfg, store, *, on_progress=None, on_stage=None, cancel_event=None)` | `Task`（状态已更新） | 捕获单条错误并写库；环境级故障继续上抛 |
+| `pipeline.run_download/run_asr/run_frames()` | `(task, cfg, store[, device], *, on_progress, on_stage, cancel_event)` | `None`（状态已写库） | **不吞异常**，状态标记由调用方负责——这三个才是 `dispatcher` 的调度单位 |
+| `dispatcher.Dispatcher` | `submit(list[Task]) -> int` / `start()` / `pause()` / `resume()` / `cancel(id)` / `retry(id)` / `stop(timeout)` / `wait()` / `snapshot()` / `trace` / `peak_concurrency()` | 无（副作用式） | 内部消化单条失败；环境级故障转 `abort_reason`，剩余任务保持 `pending` |
 | `cookies.ensure(platform)` | 阶段 4 | `Path`（cookies.txt） | 无效则抛 `CookieExpired` |
 | `summarizer.run(transcript)` | 阶段 4 | md 路径 | API 失败重试 3 次后标记 `failed` |
 | `rpc.serve()` | `()` | stdout 事件流 | 协议见 `docs/IPC协议规格.md`；worker 崩溃由宿主重启一次 |
@@ -360,11 +377,31 @@ pending ──▶ downloading ──▶ downloaded ──▶ transcribing ──
                                                     done
 
   任意阶段 ──失败──▶ failed（记录 stage_error，可手动重试）
+  任意非终态 ─用户取消─▶ cancelled（终态；不算失败，重启后不会自己重跑）
 ```
+
+**终态只有两个：`done` 与 `cancelled`**（`app/models/task.py::TERMINAL_STATUSES`）。
+`failed` **不是**终态——它需要显式 `retry` 才重跑，但 `url` 记录必须一直留着，
+否则用户改好 cookie 后重跑会变成「新增一条」而不是「重试同一条」。
+
+**`cancelled` 刻意不进 `INTERRUPTED_ROLLBACK`**（2026-10-03 加入）。原因：中止态集合的语义是
+「进程可能被杀时留下的、不可信的中间态」，而 `cancelled` 是用户明确表达的意图。
+把它按中途态回退成 `downloaded`，下次启动就会**违背用户意愿自动重跑**——这是那种
+「看起来只是个小配置，实际是行为错误」的坑。
 
 **启动时行为**：扫 `state.db`，把 `downloading/transcribing/framing` 这些"中途态"重置为对应的上一稳定态（因为它们可能是在进程被杀时中断的），然后继续。`done` 的直接跳过。
 
+> **实测验证（2026-10-03）**：`taskkill /F /T` 强杀后 DB 留下
+> `{'done': 3, 'transcribing': 1, 'downloaded': 6, 'failed': 1}`，
+> 重启后 3 条 `done` 的 **`status` / `updated_at` / 产出文件 mtime 三者均未被改动**，
+> 1 条中途态回退续跑，最终收敛到 `{'done': 10, 'failed': 1}`。
+> 详见 `docs/实测记录.md` §2.5。
+
 **`url` 上的 UNIQUE 约束**就是去重机制——重复添加同一个链接会被忽略并提示"已处理过"。
+
+> ⚠️ **实现上的一处必须对齐**：`dispatcher.submit()` 会主动跳过 `done` 的任务，
+> 所以 `--force` / `--retry` 那几条必须在入队前把状态重新盖回 `pending`。
+> 漏了这一步的表现是「产出目录被删了，却一条都没入队」（2026-10-03 实测踩到）。
 
 ---
 
@@ -476,10 +513,44 @@ URL_PATTERNS = {
 
 - 目标：批量 10 条 URL，Ctrl+C 杀掉进程，重启后能从断点继续
 - 交付：`dispatcher.py` + 完整状态机
+- 状态：✅ **完成（2026-10-03）**。验收脚本 `tools/phase2_acceptance.py`，**23/23 通过**
 - 验收：
   - 10 条任务全部完成，耗时符合 §2 的吞吐预估
   - 杀掉进程后重启，已完成的不重跑（检查 `state.db` 的 status）
   - 故意混入 1 条坏链接，确认它失败后**其他 9 条正常完成**
+
+#### 验收实测（2026-10-03，真跑 GPU）
+
+输入构造：从 `samples/video.mp4` 用 `-c copy` 切 **10 条 60 秒片段**（秒级完成）+ **1 条坏链接**
+（指向不存在的本地文件）。切片段而不是用 10 条真实 URL 的理由：验收要验的是**调度**，
+不是转写质量（那是阶段 1 的事）。调度错误与视频长度无关，用长视频只会让每次验收跑半小时。
+
+| 判据 | 实测 |
+|---|---|
+| 10 条全部完成 | ✅ `{'done': 10, 'failed': 1}`，墙钟 83.1s（阶段总耗时 90.3s） |
+| 坏链接只影响自己 | ✅ 它停在下载阶段（`本地文件不存在`），其余 10 条正常 done |
+| 批次里无残留中途态 | ✅ 无 `downloading` / `transcribing` / `framing` |
+| 转写峰值并发 == 1 | ✅ `{'downloading': 8, 'transcribing': 1, 'framing': 1}` |
+| **阶段确实重叠**（证伪 §11.2 的推断） | ✅ 重叠系数 **1.10×**（> 1.0；1.0 即完全串行） |
+| 强杀前进程仍在运行 | ✅ 跑满 30 秒后 `taskkill /F /T` |
+| 被硬杀而非优雅退出 | ✅ 留下 `transcribing` 中途态 |
+| 重启后已完成的不重跑 | ✅ 3 条 done 的 **status / `updated_at` / 转写稿 mtime 三者均未被改动** |
+| 中途态回退 + 断点续跑 | ✅ 日志实测：`启动重置：1 条中途态任务已回退` + `已完成，跳过` ×3 + `从断点续跑` ×7 |
+| 续跑后收敛 | ✅ 最终 `{'done': 10, 'failed': 1}` |
+
+**重叠系数只有 1.10× 是如实结果，不是缺陷**：60 秒片段的转写占全部阶段耗时约 90%，
+能与它重叠的只有下载（本地硬链接，毫秒级）与抽帧（约 1 秒）。真实 20 分钟视频的转写占比更高，
+重叠收益只会更小——这恰好**正面印证了 §3.1「转写是串行瓶颈」的判断**：流水线架构的价值不在
+「重叠省时间」，而在于把不占 GPU 的阶段挪出转写的关键路径，使 GPU 不空转。
+
+**同一实现另有两层验收**（都不需要 GPU，可随时重跑）：
+
+| 手段 | 判据数 | 覆盖 |
+|---|---|---|
+| `python tools/dispatcher_selftest.py` | 53/53 | 调度语义：暂停恢复、取消排队/取消运行中、内存护栏、有界背压、start 幂等、Store 线程安全。用假阶段函数，几秒跑完 |
+| `python tools/rpc_smoke.py` | 19/19 | IPC 协议层：协议纯净性、握手、幂等、控制面（`start`/`pause`/`resume`/`cancel_task`/`retry_task`）、EOF 自杀不留孤儿 |
+| 阶段 1 回归（`run samples/video.mp4 --force`） | 逐字节 | 批量路径下的产出与 v2 基线 txt/srt/json **三格式逐字节一致**（24547 / 44299 / 70249 字节，662 段） |
+
 
 ### 阶段 3：GUI（Rust + Tauri）
 
@@ -649,7 +720,12 @@ add_nvidia_dll_dirs()
 ### 未验证项（诚实标注）
 
 1. ~~**GPU 全量转写性能**~~ → **已验证**，见 §2.2。仍是单次测量，长跑稳定性（连续 3 小时以上是否降频/OOM）未测。
-2. **并发正确性**：流水线架构是设计推断，**未经实测**。阶段 2 的验收标准（10 条批量的总耗时）就是用来证伪它的。
+2. ~~**并发正确性**：流水线架构是设计推断，**未经实测**。~~ → **已实测（2026-10-03，见 §8 阶段 2）**。
+   结论：设计成立。转写峰值并发确为 1（GPU 单卡串行）、阶段确实重叠（系数 1.10×）、
+   断点续跑在进程被 `taskkill /F /T` 强杀后仍正确（已完成的条目 status / `updated_at` / 产出文件 mtime 三者均未被改动）。
+   **但仍有一条未验证**：批量规模只到 10 条 × 60 秒，未做过 100 条 × 20 分钟的长跑——
+   内存护栏（§3.2「低于 2 GB 暂停取新任务」）在真实负载下是否会被触发、触发后恢复是否平滑，**未测**。
+   自测脚本用人为压低的内存阈值验证过逻辑（`tools/dispatcher_selftest.py` 用例 7），但那不是真实负载。
 3. **B站 / YouTube 的实际可用性**：本机从未测过这两个平台。YouTube 在国内需代理，B站部分视频需登录。**建议阶段 1 只做抖音，跑通后再扩展。**
 4. **汇总模块的 token 成本**：一条 20 分钟视频转写稿约 8000–10000 字，是否超出所选模型的上下文、单条成本多少，**未测**。
 5. **两层打包**：PyInstaller（ctranslate2 + CUDA DLL，DLL 需随包分发）+ Tauri bundler，**未验证**，复杂度高于原单层方案。
@@ -676,9 +752,21 @@ add_nvidia_dll_dirs()
 
 ### 12.2 推进顺序
 
-按 `§8` 顺序走，**不要跳阶段**。当前处于**阶段 1**——把 `prototypes/` 下那三个已经跑通的脚本（`state2cookie.py` / `transcribe.py` / `make_sheets.py`）重构成 `app/core/` 下的正式模块。它们已经被 2026-10-02 那一轮真实任务验证过，是整套系统里最可靠的部分。
+按 `§8` 顺序走，**不要跳阶段**。当前处于**阶段 3（GUI：Rust + Tauri）**。
 
-`prototypes/README.md` 列了每个脚本对应的目标模块、必须保留的实现细节（尤其是 CUDA DLL 加载那三层要求）、以及**不该照抄的部分**（命令行参数解析不该进核心模块）。
+阶段 1（核心流水线）与阶段 2（并发调度 + 断点续跑）均已完成并验收通过，
+Python 功能层已是「可直接被 Rust 宿主驱动」的形态（`app/rpc.py` + `docs/IPC协议规格.md` v1.1）。
+
+阶段 3 的**唯一前置阻塞**是工具链：本机 `rustc` / `cargo` 未安装，`app-ui/` 尚未创建。
+需要先补 `winget install Rustlang.Rustup` + VS Build Tools（MSVC），然后：
+
+1. 建 `app-ui/`（Tauri 2.x 工程），`src-tauri/` 里配 `bundle.externalBin` 指向 Python sidecar
+2. Rust 侧实现进程监督器：spawn worker → 握手 → 事件分发 → Job Object 回收（§7）
+3. 前端实现任务表格 / 进度 / 日志（§7.2）
+4. 验收：§10 清单 + `docs/IPC协议规格.md` §9 的全部 8 条协议判据
+
+> 建议在阶段 3 末期就做一次「PyInstaller 打包 + Tauri sidecar」的最小验证，
+> 不要拖到阶段 5——那两层打包叠加的风险是 §11 里最高的一条。
 
 ---
 

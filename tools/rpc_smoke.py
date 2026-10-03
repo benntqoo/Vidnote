@@ -244,11 +244,55 @@ def run_main_flow(env: dict[str, str]) -> Host:
     n = len(lst.get("data", {}).get("tasks", [])) if lst else -1
     host.record("list_tasks", lst is not None and n == 2, f"返回 {n} 条")
 
-    # ---- 判据：未实现命令返回明确错误码 ----
+    # ---- 判据：流水线控制面（阶段 2 起由 dispatcher 提供）----
+    # 先把队列清空：start 会去跑 store 里的可续跑任务，留着它们会真发网络请求。
+    # 清空同时验证 remove_task。
+    removed = []
+    for task in lst.get("data", {}).get("tasks", []) if lst else []:
+        host.send("remove_task", {"task_id": task["task_id"]}, req_id=f"c-rm-{task['task_id']}")
+        removed.append(host.await_event("task_removed") is not None)
+    host.record("remove_task 清空队列", all(removed) and len(removed) == 2, f"移除 {sum(removed)}/2")
+
     host.send("start", req_id="c-7")
-    err = host.await_event("error")
-    code = err.get("data", {}).get("code") if err else None
-    host.record("未实现命令返回 E_NOT_IMPLEMENTED", code == "E_NOT_IMPLEMENTED", f"code={code}")
+    started_evt = host.await_event("started")
+    sd = started_evt.get("data", {}) if started_evt else {}
+    host.record(
+        "start → started（空队列幂等启动）",
+        started_evt is not None and sd.get("added") == 0,
+        f"added={sd.get('added')} state={sd.get('state')}",
+    )
+
+    host.send("pause", req_id="c-8")
+    paused_evt = host.await_event("paused")
+    host.record(
+        "pause → paused（被接受）",
+        paused_evt is not None and paused_evt.get("data", {}).get("accepted") is True,
+        f"state={paused_evt.get('data', {}).get('state') if paused_evt else None}",
+    )
+
+    host.send("resume", req_id="c-9")
+    resumed_evt = host.await_event("resumed")
+    host.record(
+        "resume → resumed（被接受）",
+        resumed_evt is not None and resumed_evt.get("data", {}).get("accepted") is True,
+        f"state={resumed_evt.get('data', {}).get('state') if resumed_evt else None}",
+    )
+
+    host.send("cancel_task", {"task_id": 99999}, req_id="c-10")
+    err_cancel = host.await_event("error")
+    host.record(
+        "cancel_task 不存在的 id → E_BAD_ARGS",
+        bool(err_cancel) and err_cancel.get("data", {}).get("code") == "E_BAD_ARGS",
+        f"code={err_cancel.get('data', {}).get('code') if err_cancel else None}",
+    )
+
+    host.send("retry_task", {"task_id": 99999}, req_id="c-11")
+    err_retry = host.await_event("error")
+    host.record(
+        "retry_task 不存在的 id → E_BAD_ARGS",
+        bool(err_retry) and err_retry.get("data", {}).get("code") == "E_BAD_ARGS",
+        f"code={err_retry.get('data', {}).get('code') if err_retry else None}",
+    )
 
     # ---- 等 GPU 真实验证（异步，要加载模型）----
     print("   … 等待 env_verified（真实推理验证，需加载模型 5-8 秒）")
@@ -277,13 +321,22 @@ def run_main_flow(env: dict[str, str]) -> Host:
     return host
 
 
-def run_eof_flow(env: dict[str, str]) -> None:
-    """判据 6：宿主消失（stdin EOF）时 worker 必须自行退出，不留孤儿。"""
+def run_eof_flow(env: dict[str, str], judgements: list[tuple[str, bool, str]]) -> None:
+    """宿主消失（stdin EOF）时 worker 必须自行退出，不留孤儿。
+
+    这一步必须**单开一个 worker**（它要自杀，不能复用前面那个），因此也不能把结果
+    记在 `run_main_flow` 返回的 host 上。
+
+    ⚠️ 2026-10-03 修：原先这里新建 host 后 `record` 到自己身上，而 `main()` 只打印
+    第一个 host 的判据 → **这一条从未被报告**，脚本却显示「18/18 通过」。
+    一个悄悄不报告的判据比没有判据更危险：它制造虚假的信心。
+    所以现在把结果列表**显式传进来**（而不是返回新 host），漏接会在类型上看得见。
+    """
     host = Host(env)
     host.send("hello", {"client_version": "0.0.0-smoke"})
     ready = host.await_event("ready", timeout=15)
     if ready is None:
-        host.record("EOF 自杀", False, "握手就没成功")
+        judgements.append(("EOF 自杀（3s 内）", False, "握手就没成功"))
         host.proc.kill()
         return
 
@@ -292,10 +345,12 @@ def run_eof_flow(env: dict[str, str]) -> None:
     try:
         code = host.proc.wait(timeout=10)
         elapsed = time.time() - started
-        host.record("EOF 自杀（3s 内）", elapsed < 3.0, f"{elapsed:.2f}s 内退出，exit={code}")
+        judgements.append(
+            ("EOF 自杀（3s 内）", elapsed < 3.0, f"{elapsed:.2f}s 内退出，exit={code}")
+        )
     except subprocess.TimeoutExpired:
         host.proc.kill()
-        host.record("EOF 自杀（3s 内）", False, "10s 仍未退出，已成孤儿进程")
+        judgements.append(("EOF 自杀（3s 内）", False, "10s 仍未退出，已成孤儿进程"))
 
     host.proc.wait(timeout=5)
 
@@ -324,7 +379,7 @@ def main() -> int:
     check_protocol_purity(host)
     check_seq_monotonic(host)
 
-    run_eof_flow(env)
+    run_eof_flow(env, host.judgements)
 
     shutil.rmtree(tmp, ignore_errors=True)
 

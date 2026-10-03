@@ -1,7 +1,7 @@
 # Vidnote IPC 协议规格（Rust 宿主 ↔ Python Worker）
 
-> **版本**：v1
-> **状态**：已定稿（2026-10-02），`app/rpc.py` 已按本规格实现协议层骨架
+> **版本**：v1.1
+> **状态**：已定稿（v1 2026-10-02 / v1.1 2026-10-03），`app/rpc.py` 已按本规格实现**全部**命令与事件
 > **定位**：本文件是 Rust 侧与 Python 侧之间**唯一的接口依据**。两端任何改动必须先改本文件。
 
 ---
@@ -75,10 +75,10 @@ logging.basicConfig(stream=sys.stderr, ...)
 | `ping` | `{}` | `pong` | 心跳，见 §6 |
 | `add_tasks` | `{"urls": ["<url 或本地路径>", ...]}` | `tasks_added` | 批量入队，内部按 `PLAN §7.3` 正则抽 URL；`url` 字段有 UNIQUE 约束，重复项跳过 |
 | `remove_task` | `{"task_id": 7}` | `task_removed` | 从队列删除（不影响已完成） |
-| `start` | `{}` | `started` | 启动流水线（幂等，重复调用无副作用） |
+| `start` | `{}` | `started` | 启动流水线（幂等，重复调用无副作用）。**只入队 `resumable()` 的任务**——即「非终态且非 failed」，`failed` 需走 `retry_task`，否则一条永久失效的链接每次点「开始」都会被自动重试一遍 |
 | `pause` | `{}` | `paused` | 暂停取新任务；**已在跑的任务跑完当前阶段为止** |
 | `resume` | `{}` | `resumed` | 继续 |
-| `cancel_task` | `{"task_id": 7}` | `task_update` | 取消单条。运行中则终止其子进程 |
+| `cancel_task` | `{"task_id": 7}` | `task_update` | 取消单条。运行中则置其 `cancel_event`，由阶段函数在**下一个检查点**中断并杀掉子进程 |
 | `retry_task` | `{"task_id": 7}` | `task_update` | 重置失败项到上一稳定态并重新入队 |
 | `list_tasks` | `{}` | `task_list` | 拉取全量任务快照（Rust 启动时同步一次） |
 | `get_concurrency` | `{}` | `concurrency` | 查询当前实际并发数（用于状态栏展示） |
@@ -86,6 +86,31 @@ logging.basicConfig(stream=sys.stderr, ...)
 
 **未知命令**：回 `error`，`code = "E_UNKNOWN_CMD"`，**不退出进程**。
 **参数校验失败**：回 `error`，`code = "E_BAD_ARGS"`，**不退出进程**。
+`task_id` 不存在（含 `cancel_task` / `retry_task` / `remove_task`）同样回 `E_BAD_ARGS`。
+
+### 3.1 取消语义（v1.1 新增，实现约定）
+
+取消是**协作式**的，不是强杀。`cancel_task` 只做到「置一个 `threading.Event`」，
+真正的中断发生在阶段函数的内建检查点上：
+
+| 阶段 | 检查点位置 | 取消延迟 | 中断后行为 |
+|---|---|---|---|
+| `downloading` | yt-dlp 每输出一行进度 | < 1 s | 杀 yt-dlp 进程树，抛 `TaskCancelled` |
+| `audio` | ffmpeg 每输出一行 `-progress` | ≈ 0.5 s | 杀 ffmpeg，抛 `TaskCancelled` |
+| `transcribing` | **每个 segment 边界** | 一条 segment 的时长 | 抛 `TaskCancelled`，**不写产出文件** |
+| `framing` | 每检出一帧 | < 1 s | 抛 `TaskCancelled` |
+
+> ⚠️ **转写只能在 segment 边界中断**。`CTranslate2` 是进程内的 C++ 调用，**没有中断接口**——
+> 进程内取消不可能做成「立即返回」。这是硬约束，Rust 侧 UI 应把取消渲染成「正在取消…」而非瞬时完成。
+
+两条实现上的硬要求（都是踩过的坑）：
+
+1. **`cancel_event` 必须在阶段开始前就存在**。若在阶段启动后才创建，`cancel()` 会给一条
+   正在跑的任务新建一个事件，而那个阶段永远看不到它——表现为「点了取消，任务照跑到结束」。
+   正确做法是在投递任务的锁内先建好事件，阶段函数从字典里取。
+2. **`TaskCancelled` 刻意不是 `StageError` 的子类**。取消是用户意图，不是故障：
+   它不计入失败数，且**不写入 `INTERRUPTED_ROLLBACK`**——被取消的任务重启后是 `cancelled`
+   终态，不会自己又跑起来。
 
 ---
 
@@ -93,15 +118,19 @@ logging.basicConfig(stream=sys.stderr, ...)
 
 | `name` | `data` 字段 | 说明 |
 |---|---|---|
-| `ready` | `{"server_version", "protocol", "gpu_usable", "gpu_verified", "concurrency": {"n_asr","n_dl","n_frame","n_sum"}, "db_path", "config_is_default"}` | 握手完成。**快速返回，不阻塞**（GPU 真实验证是异步的，见 §4.2） |
+| `ready` | `{"server_version", "protocol", "gpu_usable", "gpu_verified", "concurrency": {"n_asr","n_dl","n_frame","n_sum"}, "pipeline_state", "db_path", "config_is_default"}` | 握手完成。**快速返回，不阻塞**（GPU 真实验证是异步的，见 §4.2） |
 | `env_verified` | `{"gpu_usable", "detail", "concurrency"}` | GPU **真实推理验证**结果。异步推送，见 §4.2 |
 | `pong` | `{}` | 心跳响应 |
 | `tasks_added` | `{"added": [{"task_id","url","title"}], "skipped": [{"url","reason"}]}` | `reason`: `duplicate` \| `bad_url` \| `unsupported` |
 | `task_removed` | `{"task_id": 7}` | — |
 | `started` / `paused` / `resumed` | `{}` | — |
+| `pipeline_state` | `{"state": "idle" \| "running" \| "paused" \| "aborted" \| "stopped"}` | 调度器状态跃迁。与 `started`/`paused`/`resumed` 是**两层**：后者是命令回执，本事件是调度器的实际状态 |
 | `task_list` | `{"tasks": [<task 快照>, ...]}` | task 快照结构见 §5 |
 | `concurrency` | `{"n_asr","n_dl","n_frame","n_sum"}` | — |
 | `task_update` | `{"task_id","status","stage","progress","elapsed_sec","out_dir","error"}` | **核心事件**。状态或进度变化时推送，见 §5 |
+| `resource_warning` | `{"reason","avail_gb"}` | 可用内存低于阈值，取新任务闸门已关闭。UI 建议提示「已暂停取新任务」 |
+| `batch_aborted` | `{"reason"}` | 环境级故障（CUDA/模型）导致整批中止，剩余任务保持 `pending`。**UI 应弹可操作提示，不是「失败了」** |
+| `batch_done` | `{"counts": {"done": 10, "failed": 1, ...}}` | 批次收敛 |
 | `log` | `{"level","msg"}` | 转发 Python `logging` 记录。`level`: `debug`\|`info`\|`warning`\|`error` |
 | `error` | `{"code","msg","fatal"}` | `fatal=true` 表示 Python 即将退出 |
 | `bye` | `{}` | 退出前**最后一条**。发出后 Python 立即结束进程 |
@@ -113,6 +142,14 @@ logging.basicConfig(stream=sys.stderr, ...)
 - **状态变化**：立即推送
 - **进度变化**：同一任务最快 **每 200 ms 一次**；或进度绝对增量 ≥ 1% 时提前推送
 - **`log`**：沿用 `logging` 级别过滤，默认只发 `info` 及以上
+
+> 落地常量在 `app/core/dispatcher.py`：`PROGRESS_MIN_INTERVAL_SEC = 0.2`、
+> `PROGRESS_MIN_DELTA = 0.01`。限流在**调度器**里做，不在 `rpc.py` 里做——
+> 因为 `cli.py` 也要吃同一份回调，重复限流会让两个入口的行为不一致。
+
+**`batch_aborted` 会额外附一条 `error`**（`code = "E_ENV_FATAL"`，`fatal = false`）：
+整批停了但 worker 仍能响应命令（`get_concurrency` / `shutdown` 照常），所以不是进程级致命。
+这样 Rust 侧不用专门解析 `batch_aborted` 就能走统一的错误通道。
 
 ### 4.2 为什么 GPU 验证是异步的
 
@@ -145,7 +182,17 @@ UI 要白屏等 5 秒才能拿到 `ready`。因此拆成两步：
 pending → downloading → downloaded → transcribing → transcribed
         → framing → summarizing → done
 任意阶段 → failed
+任意非终态 → cancelled          # v1.1 新增：取消是用户意图，不是故障
 ```
+
+`cancelled` 与 `failed` 的区别（**Rust 侧不要合并渲染**）：
+
+| | `failed` | `cancelled` |
+|---|---|---|
+| 触发 | `StageError` / 未预期异常 | 用户调用 `cancel_task` |
+| 计入失败数 | 是 | **否** |
+| 重启后 | 保持 `failed`，需 `retry_task` | 保持 `cancelled` 终态，**不会自己重跑** |
+| 批次收尾 | 继续跑其余任务 | 继续跑其余任务 |
 
 `stage` 是给 UI 显示的中文阶段名，与 `status` 一一对应：
 
@@ -160,6 +207,7 @@ pending → downloading → downloaded → transcribing → transcribed
 | `summarizing` | 汇总中 | `-1.0`（API 无进度） |
 | `done` | 完成 | `1.0` |
 | `failed` | 失败 | 保持失败时的值 |
+| `cancelled` | 已取消 | 保持取消时的值 |
 
 **`progress = -1.0` 约定**：表示「进行中但进度不可知」。UI 应显示不确定态进度条，**不要显示 0%**。
 
@@ -240,7 +288,7 @@ stdout 写入     → 加锁后单线程写入（JSON Lines 天然按行独立�
 | `E_ENV_FATAL` | CUDA / 模型加载失败 | **true** | 展示 stderr 尾部，不重启（重启也没用） |
 | `E_DISK_FULL` | 剩余空间不足 5 GB | false | 告警，暂停取新任务 |
 | `E_INTERNAL` | 未预期异常 | false | 附 traceback，重启 worker |
-| `E_NOT_IMPLEMENTED` | 命令已定义但尚未实现 | false | 记录。**阶段 1 期间 `start`/`pause`/`resume`/`cancel_task`/`retry_task` 会返回此码**（依赖 `dispatcher.py`） |
+| `E_NOT_IMPLEMENTED` | 命令已定义但尚未实现 | false | 记录。**v1.1 起无任何命令返回此码**（`start`/`pause`/`resume`/`cancel_task`/`retry_task` 已随 `dispatcher.py` 落地）；保留该项是为了阶段 4 的新命令 |
 
 > **`E_ENV_FATAL` 会中止整批**，与 `PLAN §4.1` 的设计原则一致：转写是唯一「失败即整批中止」的阶段，因为那意味着环境坏了，继续跑只会浪费一整夜。
 
@@ -248,18 +296,43 @@ stdout 写入     → 加锁后单线程写入（JSON Lines 天然按行独立�
 
 ## 9. 验收判据
 
-协议层的验收**不依赖 Rust 端**，用 Python 写一个 mock client 即可全部覆盖：
+协议层的验收**不依赖 Rust 端**，用 Python 写一个 mock client 即可全部覆盖。
+落地实现：`tools/rpc_smoke.py`，**实跑 19/19 通过**（2026-10-03，`python tools/rpc_smoke.py`）。
 
-| # | 判据 | 方法 |
+| # | 判据（脚本内的实际名称） | 方法 / 实测 |
 |---|---|---|
-| 1 | **协议纯净性**：全程 stdout 每一行都可 `json.loads` | mock client 逐行解析，任一行失败即判失败。**这条能抓住所有 stray print** |
-| 2 | 握手正确 | 发 `hello` 应收到 `ready`，且 `data.gpu_usable` 为布尔值 |
-| 3 | 未知命令不崩 | 发 `{"name":"no_such_cmd"}` 应回 `E_UNKNOWN_CMD`，进程存活（随后 `ping` 仍能收到 `pong`） |
-| 4 | 非法 JSON 不崩 | 发 `not json` 应回 `E_BAD_FRAME`，进程存活 |
-| 5 | 心跳可用 | 转写进行中发 `ping`，**2 s 内**必须收到 `pong`（验证独立读线程生效） |
-| 6 | EOF 退出 | mock client 直接关闭 stdin，Python 应在 **3 s 内**自行退出 |
-| 7 | `seq` 连续 | 收到的 `seq` 严格递增且无跳号 |
-| 8 | 优雅关闭 | 发 `shutdown` 应收到 `bye` 且进程退出码为 `0` |
+| 1 | **协议纯净性** | 全程 stdout 每一行都必须能 `json.loads`。**这条能抓住所有 stray print**。实测 35/35 行合法 |
+| 2 | **`seq` 连续** | 严格递增且无跳号。实测 1..35 无跳号 |
+| 3 | 握手 `hello→ready` | `ready.data.gpu_usable` 必须是布尔值（不是 `0/1`、不是字符串），且回填命令 `id` |
+| 4 | 未知命令不崩 | 回 `E_UNKNOWN_CMD`，且**随后 `ping` 仍通**（证明进程没死） |
+| 5 | 非法 JSON 不崩 | 发 `this is not json at all` → 回 `E_BAD_FRAME` |
+| 6 | 心跳 <2 s | 往返实测 0 ms |
+| 7 | `add_tasks` 抽 URL + 批内去重 | 3 行输入 → 入队 2 条（分享文案里的 URL 被正确抽出） |
+| 8 | `add_tasks` 跨批次去重 | 重复链接以 `reason=duplicate` 出现在 `skipped` 里 |
+| 9 | `list_tasks` | 返回全量快照 |
+| 10 | `remove_task` | 清空队列 |
+| 11 | `start` 幂等 | 空队列 `start` → `started`，`added=0` |
+| 12 | `pause` → `paused` | 被接受 |
+| 13 | `resume` → `resumed` | 被接受 |
+| 14 | `cancel_task` 非法 id | 回 `E_BAD_ARGS`，进程存活 |
+| 15 | `retry_task` 非法 id | 回 `E_BAD_ARGS`，进程存活 |
+| 16 | `env_verified` 异步推送 | 真实推理验证结果异步到达：`device=cuda`、`gpu_usable=True` |
+| 17 | 优雅关闭 `shutdown→bye` | 收到 `bye` |
+| 18 | 退出码为 0 | worker 自行 `exit(0)` |
+| 19 | **EOF 自杀（3 s 内）** | 关掉 stdin 模拟宿主消失，worker 必须自行退出，不留孤儿。实测 0.02 s |
+
+**判据 1 是最有价值的一条**：它用一个断言覆盖了「任何地方不小心 `print` 到 stdout」这一整类
+协议污染事故。新增任何代码后重跑它，成本几秒。
+
+> ⚠️ **判据 19 曾经「存在但不被报告」**（2026-10-03 修复）。它单开一个 worker（因为要自杀，
+> 不能复用主流程那个），却把结果 `record` 到自己身上，而 `main()` 只打印主 host 的判据
+> → 那条判据从未出现在输出里，脚本却显示 18/18。**一个悄悄不报告的判据比没有判据更危险**：
+> 它制造虚假的信心。现在结果列表改为显式传入。
+> 教训可以推广成一条规则：**凡是「新开一个对象来承载结果」的测试代码，都要确认结果真的被收集了。**
+
+> ⚠️ 判据 6 的「心跳」测的是**空闲态**往返（0 ms），**不能**据此断言「转写进行中心跳仍通」。
+> 转写阻塞主循环是「UI 假死」的典型来源，真正验证它需要在转写进行中发 `ping`——
+> 那需要在协议测试里塞一条真实转写任务。**本条尚未覆盖，如实标注。**
 
 ---
 
@@ -277,3 +350,4 @@ stdout 写入     → 加锁后单线程写入（JSON Lines 天然按行独立�
 | 日期 | 版本 | 变更 |
 |---|---|---|
 | 2026-10-02 | v1 | 首版。确立 stdio + JSON Lines、命令/事件清单、状态语义、心跳、进程回收与验收判据 |
+| 2026-10-03 | v1.1 | ① 新增 `cancelled` 状态与 §3.1 取消语义（协作式取消、检查点位置、两条硬要求）；② 事件清单补齐调度器事件：`pipeline_state` / `resource_warning` / `batch_aborted` / `batch_done`，`task_update` 之外的控制面事件改名映射（`dispatcher` 只报事实，名字翻译在 `rpc.py` 的 `EVENT_NAMES`）；③ `ready` 增 `pipeline_state`；④ §4.1 补限流落地常量与「限流在调度器做，不在 rpc 做」的理由；⑤ §9 判据从 8 条扩到 19 条（含新修好的 EOF 判据），并标注两条**尚未覆盖**的项（转写进行中的心跳、控制面事件在真实批次下的时序）；⑥ `E_NOT_IMPLEMENTED` 已无命令返回 |

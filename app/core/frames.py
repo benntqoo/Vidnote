@@ -30,8 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from app.core.errors import StageError
+from app.core.errors import StageError, TaskCancelled, raise_if_cancelled
 from app.core.ffmpeg_locator import find_ffmpeg
+from app.core.proc import kill_process
 
 #: `showinfo` 输出的时间戳：`n: 12 pts: 12345 pts_time:12.345 ...`
 _PTS_RE = re.compile(r"pts_time:([0-9.]+)")
@@ -72,6 +73,7 @@ def run(
     cell_width: int = 320,
     ffmpeg_path: str | None = None,
     on_progress: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> FramesResult:
     """场景检测抽帧并拼版。
 
@@ -96,7 +98,7 @@ def run(
 
     ffmpeg = find_ffmpeg(ffmpeg_path)
     timestamps = _detect_scene_frames(
-        src, frames_dir, ffmpeg, scene_threshold, max_frames, on_progress
+        src, frames_dir, ffmpeg, scene_threshold, max_frames, on_progress, cancel_event
     )
 
     frames = sorted(frames_dir.glob("frame_*.jpg"))
@@ -144,6 +146,7 @@ def _detect_scene_frames(
     threshold: float,
     max_frames: int,
     on_progress: Callable[[str, float], None] | None,
+    cancel_event: threading.Event | None = None,
 ) -> list[float]:
     """跑 ffmpeg 场景检测抽帧，返回每个输出帧的时间戳（秒）。
 
@@ -208,6 +211,7 @@ def _detect_scene_frames(
     assert proc.stdout is not None
     try:
         for raw in proc.stdout:
+            raise_if_cancelled(cancel_event)
             line = raw.strip()
             if line.startswith("frame=") and max_frames > 0:
                 value = line.split("=", 1)[1]
@@ -218,6 +222,10 @@ def _detect_scene_frames(
                         _report(on_progress, "framing", ratio)
             elif line == "progress=end":
                 break
+    except TaskCancelled:
+        kill_process(proc)
+        reader.join(timeout=5)
+        raise
     finally:
         proc.stdout.close()
 

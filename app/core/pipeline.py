@@ -10,9 +10,19 @@
     downloading → downloaded → [抽音频] → transcribing → transcribed
                 → [framing]（可选）→ done
 
+本模块导出**三个阶段函数**（`run_download` / `run_asr` / `run_frames`）与它们的
+串行组合 `run_one`。两种调用方式共用同一份实现，因此不会出现「并行路径与串行
+路径行为不一致」这类最难查的 bug：
+
+| 调用方 | 用法 | 场景 |
+|---|---|---|
+| `cli.py --jobs 1` / `rpc.py` 单条 | `run_one(...)` | 串行，阶段 1 验收走的路径 |
+| `dispatcher.py` | 三个阶段函数分别扔进各自的池 | 批量，阶段 2 |
+
 失败策略（PLAN.md §4.1）：
 
 - `StageError`（下载/抽音频/抽帧）→ 标记该条 `failed`，**不影响其他任务**
+- `TaskCancelled` → 标记该条 `failed`（文案「已取消」），**不影响其他任务**
 - `FatalEnvironmentError`（模型加载、CUDA）→ 标记该条 `failed` 后**继续向上抛**，
   由调用方中止整批——环境坏了继续跑只会浪费一整夜
 
@@ -24,13 +34,19 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
 from app.core import audio as audio_mod
 from app.core import fetcher, frames as frames_mod, transcriber
-from app.core.errors import FatalEnvironmentError, StageError, VidnoteError
+from app.core.errors import (
+    FatalEnvironmentError,
+    StageError,
+    TaskCancelled,
+    VidnoteError,
+)
 from app.core.store import Store
 from app.models.config import Config
 from app.models.task import Task, TaskStatus
@@ -42,6 +58,19 @@ ProgressFn = Callable[[str, float], None]
 StageFn = Callable[[Task], None]
 
 
+def current_device(cfg: Config) -> str:
+    """解析 `device: auto` 的落地值。
+
+    真实可用性由 `env_probe.verify_cuda()` 决定；这里只让 auto 落向 cuda，
+    避免在支持 GPU 的机器上悄悄退化成 CPU（8.7× → 1.44×）。
+    `dispatcher` 起线程前调用一次并复用——`ctranslate2` 的导入开销不值得每条付一次。
+    """
+    return cfg.runtime.effective_device(_cuda_device_present())
+
+
+# ---------------------------------------------------------------- 串行组合
+
+
 def run_one(
     task: Task,
     cfg: Config,
@@ -49,6 +78,7 @@ def run_one(
     *,
     on_progress: ProgressFn | None = None,
     on_stage: StageFn | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Task:
     """跑完一条任务的完整链路。返回更新后的 `task`。
 
@@ -57,17 +87,19 @@ def run_one(
     if task.id is None:
         raise ValueError("run_one 需要 task.id——先用 store.add() 插入")
 
-    work = cfg.work_path()
-    work.mkdir(parents=True, exist_ok=True)
-    device = cfg.runtime.effective_device(_cuda_device_present())
+    cfg.work_path().mkdir(parents=True, exist_ok=True)
+    device = current_device(cfg)
+    hooks = {"on_progress": on_progress, "on_stage": on_stage, "cancel_event": cancel_event}
 
     try:
-        _download(task, cfg, store, work, on_progress, on_stage)
-        _transcribe(task, cfg, store, device, on_progress, on_stage)
-        _frame(task, cfg, store, on_progress, on_stage)
+        run_download(task, cfg, store, **hooks)
+        run_asr(task, cfg, store, device, **hooks)
+        run_frames(task, cfg, store, **hooks)
     except FatalEnvironmentError as exc:
         _fail(task, store, str(exc), on_stage)
         raise
+    except TaskCancelled:
+        _fail(task, store, "已取消", on_stage)
     except VidnoteError as exc:
         # 下载 / 抽音频 / 抽帧 —— 只影响当前这条
         logging.warning("任务 %s 失败：%s", task.id, exc)
@@ -80,16 +112,26 @@ def run_one(
 
 
 # ---------------------------------------------------------------- 各阶段
+#
+# 三个阶段函数是 `dispatcher.py` 的调度单位。共同约定：
+#   - **不吞异常**：失败向上抛，状态标记由调用方负责（`run_one` 或 dispatcher）
+#   - `cancel_event` 可选，None 时零行为差异
+#   - 自带断点续跑判断（已有产出就跳过），因此重复调用是安全的
 
 
-def _download(
+def run_download(
     task: Task,
     cfg: Config,
     store: Store,
-    work: Path,
-    on_progress: ProgressFn | None,
-    on_stage: StageFn | None,
+    *,
+    on_progress: ProgressFn | None = None,
+    on_stage: StageFn | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
+    """下载阶段：`downloading → downloaded`。"""
+    work = cfg.work_path()
+    work.mkdir(parents=True, exist_ok=True)
+
     if task.video_path and Path(task.video_path).is_file():
         # 断点续跑：上次已下完，直接进入下一阶段
         logging.info("任务 %s 已有视频，跳过下载", task.id)
@@ -101,7 +143,7 @@ def _download(
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
 
-    result = fetcher.download(task, cfg, staging, on_progress)
+    result = fetcher.download(task, cfg, staging, on_progress, cancel_event)
 
     task.title = result.title or task.title or result.video_path.stem
     task.duration_sec = result.duration_sec or task.duration_sec
@@ -121,14 +163,24 @@ def _download(
     _set(task, store, TaskStatus.DOWNLOADED, on_stage)
 
 
-def _transcribe(
+def run_asr(
     task: Task,
     cfg: Config,
     store: Store,
     device: str,
-    on_progress: ProgressFn | None,
-    on_stage: StageFn | None,
+    *,
+    on_progress: ProgressFn | None = None,
+    on_stage: StageFn | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
+    """抽音频 + 转写：`downloaded → ... → transcribed`。
+
+    抽音频为什么要放在这里而不是单独一个池：实测 1.44 秒 / 1204 秒音频
+    （docs/实测记录.md §2.1），相对转写的 2 分 18 秒只占 1%。为它加一个线程池
+    并往 IPC 协议的 `concurrency` 事件里加 `n_audio` 字段，收益是「100 条视频
+    省 2.5 分钟」（0.6%），代价是协议契约变更 + 一处新的并发点。
+    不值当，故并入转写池——转写池本来就恒为 1（GPU 单卡串行），没有争抢。
+    """
     out_dir = Path(task.out_dir)  # type: ignore[arg-type]
     video = Path(task.video_path)  # type: ignore[arg-type]
 
@@ -140,6 +192,7 @@ def _transcribe(
             ffmpeg_path=cfg.paths.ffmpeg,
             total_sec=task.duration_sec,
             on_progress=on_progress,
+            cancel_event=cancel_event,
         )
     task.audio_path = str(audio_path)
 
@@ -160,6 +213,7 @@ def _transcribe(
         device=device,
         compute_type=cfg.runtime.effective_compute_type(device),
         on_progress=on_progress,
+        cancel_event=cancel_event,
     )
     task.transcript_json = str(output.json)
     task.duration_sec = task.duration_sec or int(output.duration_sec)
@@ -176,13 +230,20 @@ def _transcribe(
         store.update(task)
 
 
-def _frame(
+def run_frames(
     task: Task,
     cfg: Config,
     store: Store,
-    on_progress: ProgressFn | None,
-    on_stage: StageFn | None,
+    *,
+    on_progress: ProgressFn | None = None,
+    on_stage: StageFn | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
+    """抽帧 + 拼版（可选）：`transcribed → framing → done`。
+
+    **本阶段是唯一一个把状态推到 `done` 的地方**。即使 `frames.enabled=false`
+    也走这里——让「谁负责置 done」只有一个答案，代价是那一次空调用（微秒级）。
+    """
     if not cfg.frames.enabled:
         _set(task, store, TaskStatus.DONE, on_stage)
         return
@@ -203,7 +264,10 @@ def _frame(
             sheet_rows=cfg.frames.sheet_rows,
             ffmpeg_path=cfg.paths.ffmpeg,
             on_progress=on_progress,
+            cancel_event=cancel_event,
         )
+    except TaskCancelled:
+        raise
     except StageError as exc:
         # 画面是可选产物：失败只记 warning，不阻断（PLAN.md §4.1）
         logging.warning("任务 %s 抽帧失败，已跳过：%s", task.id, exc)
@@ -273,11 +337,10 @@ def _find_video(out_dir: Path) -> Path | None:
 
 @lru_cache(maxsize=1)
 def _cuda_device_present() -> bool:
-    """`device: auto` 时是否按 GPU 处理。
+    """硬件层面是否有可用的 CUDA 设备（快速判据，非真实验证）。
 
-    真实可用性由 `env_probe.verify_cuda()` 决定；这里只是让 auto 落向 cuda，
-    避免在支持 GPU 的机器上悄悄退化成 CPU（8.7× → 1.44×）。
-    结果缓存：ctranslate2 的导入开销不值得每个任务付一次。
+    真实可用性由 `env_probe.verify_cuda()` 决定。结果缓存：ctranslate2 的导入
+    开销不值得每个任务付一次。
     """
     from app.core import env_probe
 

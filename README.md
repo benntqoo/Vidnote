@@ -11,13 +11,27 @@
 | — | 链路验证 + 环境实测 | ✅ 完成（见 `docs/实测记录.md`） |
 | — | 开发计划书 | ✅ 完成（见 `PLAN.md`） |
 | 1 | 核心流水线（CLI，无 GUI） | ✅ 完成（验收通过） |
-| 2 | 并发调度 + 断点续跑 | ⬜ 待开发 |
+| 2 | 并发调度 + 断点续跑 | ✅ 完成（验收 23/23 通过） |
 | 3 | GUI（Rust + Tauri，Python sidecar） | ⬜ 待开发 |
 | 4 | cookie 自动化 + 汇总模块 | ⬜ 待开发 |
 | 5 | 打包（PyInstaller + Tauri，两层） | ⬜ 待开发 |
 
 **阶段 1 完成**：全链路跑通（下载 → 抽音频 → GPU 转写 → 落库，实测 2 分 36 秒 / 20 分钟视频），
 产出与基线 `samples/transcript_gpu.txt` **逐字节一致**（662 段），复现性经两次独立运行验证。
+
+**阶段 2 完成**：`dispatcher.py` 三级流水线（下载池 → 转写池 ×1 → 抽帧池）+ 有界队列背压 +
+内存护栏 + 断点续跑。验收手段 `tools/phase2_acceptance.py`（23 条判据，真跑 GPU）：
+
+| 判据（引自 `PLAN.md` §8） | 实测 |
+|---|---|
+| 10 条任务全部完成 | ✅ 10 done（+1 条故意混入的坏链接 failed） |
+| 坏链接失败不影响其余 | ✅ 坏链接停在下载阶段，其余 10 条正常 done |
+| 杀进程后重启，已完成的不重跑 | ✅ 强杀后 3 done / 1 transcribing / 6 downloaded / 1 failed；续跑时 3 条 done 的状态、`updated_at`、转写稿 mtime **三者均未被改动** |
+| 流水线架构（`PLAN.md` §11.2 的设计推断） | ✅ 重叠系数 **1.10×**（> 1.0 即阶段确实重叠），转写峰值并发 **1** |
+
+> 重叠系数只有 1.10× 是**如实结果**，不是问题：60 秒片段的转写占全部阶段耗时约 90%，
+> 可与它重叠的只有下载（毫秒）与抽帧（约 1 秒）。真实 20 分钟视频的转写占比更高，
+> 重叠收益只会更小——这恰好印证 `PLAN.md` §3.1「转写是串行瓶颈」的判断。
 
 > 基线在 2026-10-03 **换代过**：v1 因产生它的 `initial_prompt` 未记录而作废，v2 附带**完整参数快照**
 > （`samples/README.md`）。判据始终是「逐字符严格相等」，**从未放宽**。证据链见 `docs/实测记录.md` §2.4。
@@ -52,9 +66,10 @@ Vidnote/
 ├── app/                     # ★Python 功能层
 │   ├── core/                #   env_probe / cuda_dll / ffmpeg_locator / store / urls
 │   │                        #   concurrency / fetcher / audio / transcriber / frames
-│   │                        #   pipeline（单条执行器，cli 与 rpc 共用）
+│   │                        #   pipeline（单条执行器）+ dispatcher（流水线调度）
+│   │                        #   proc（子进程回收）—— cli 与 rpc 共用
 │   ├── models/              #   Task / Config 数据类
-│   ├── cli.py               #   人用入口 + 阶段 1 验收入口
+│   ├── cli.py               #   人用入口 + 验收入口（--jobs 1 走串行黄金路径）
 │   └── rpc.py               #   Rust 宿主入口（sidecar 常驻 worker）
 ├── app-ui/                  # ★Rust + Tauri 工程（阶段 3）
 ├── prototypes/              # ★已验证原型脚本，阶段 1 重构的直接输入
@@ -64,7 +79,9 @@ Vidnote/
 │   └── README.md            #   各脚本的接口与环境假设
 ├── tools/
 │   ├── probe_env.py         #   → app/core/env_probe.py（硬件探测，已实跑）
-│   └── rpc_smoke.py         #   IPC 协议冒烟测试（13 条判据，不依赖 Rust 端）
+│   ├── rpc_smoke.py         #   IPC 协议冒烟测试（19 条判据，不依赖 Rust 端）
+│   ├── dispatcher_selftest.py   # 调度器语义自测（53 条判据，假阶段函数，秒级跑完）
+│   └── phase2_acceptance.py     # 阶段 2 正式验收（23 条判据，真跑 GPU）
 ├── models/                  # 模型权重目录（内容不入库，需自行下载）
 ├── samples/                 # 测试基线（内容不入库，仅 README.md 入库）
 └── docs/
@@ -152,6 +169,11 @@ python -m app.cli run samples/video.mp4 --no-frames
 # 批量（从文本文件，每行一条）
 python -m app.cli run --file urls.txt --limit 10
 
+# 并发调度（默认）：下载/抽帧按实测内存自动规划，转写恒为 1（GPU 单卡串行）
+python -m app.cli run --file urls.txt
+python -m app.cli run --file urls.txt --jobs 1     # 强制串行，阶段 1 验收走的那条路径
+python -m app.cli run --file urls.txt --trace trace.json   # 落盘各阶段起止记录
+
 # 查看任务表
 python -m app.cli list
 ```
@@ -160,7 +182,11 @@ python -m app.cli list
 `video.mp4 / audio.wav / transcript.{txt,srt,json} / frames/ / sheets/`。
 
 常用开关：`--initial-prompt`（领域术语提示，**会改变分段与标点**，见 `docs/实测记录.md` §2.4）、
-`--frames`、`--retry`、`--force`（删产出重跑）、`--dry-run`。
+`--frames`、`--jobs`、`--trace`、`--retry`、`--force`（删产出重跑）、`--dry-run`。
+
+**中断与续跑**：Ctrl+C 会「停止取新任务，等在跑的跑完（最长 30 秒）」，已完成的进度留在 `state.db`。
+下次运行同一条命令即自动续跑——已完成的不重跑，停在中间态的回退到上一稳定态。
+**不需要** `--retry`（那是给 `failed` / `cancelled` 用的）。
 
 ## samples/ — 测试基线（本地留存，不入库）
 
@@ -194,6 +220,9 @@ python -m app.cli list
 6. Playwright 自带的 ffmpeg 是 `--disable-everything` 构建，**没有 mp4 demuxer**，不能用。
 7. **WinGet `Links/` 下的 `ffmpeg.exe` 是 0 字节占位文件**（app execution alias）——`shutil.which()` 能命中，但调用会报 `[WinError 193] 不是有效的 Win32 应用程序`。定位时必须校验「非空 + PE 头 `MZ`」，真实可执行在 `WinGet/Packages/Gyan.FFmpeg_*/`。
 8. **`initial_prompt` 会改变分段与标点**，不只是纠术语——同一音频加了它从 681 段碎句变 662 段整句带标点。它是影响验收判据的强参数，必须随基线一起记录。
+9. **`dispatcher.submit()` 会主动跳过 `done` 状态的任务**。`--force` / `--retry` 要跑的恰恰是 `done` / `failed` 的那几条，所以必须在入队前把状态重新盖成 `pending`——否则 `--force` 会「删完产出目录却一条都不入队」，日志里只剩一句「没有任务被入队」（2026-10-03 实测踩到）。
+10. **子进程输出必须两端都钉死 UTF-8**。Windows 下子进程默认按本地代码页（cp936）编码，父进程按 UTF-8 解码 → `UnicodeDecodeError` 抛在读取线程里、日志全丢。子进程设 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`，父进程 `subprocess.run(..., encoding="utf-8", errors="replace")`。`taskkill` 同理（它会往 stderr 写 cp936 提示）。
+11. **不要用 `shutil.rmtree` 删整批产出目录**。一批任务的产出有 200+ 个文件，会命中受管环境的批量删除确认（阈值 50）而中断脚本。改为「改名旁置」，既不受该规则影响，又保留了现场。
 
 ## 内存约束（第一约束，不是 CPU 也不是显存）
 

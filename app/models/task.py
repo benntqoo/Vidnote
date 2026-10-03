@@ -17,7 +17,12 @@ _ILLEGAL_FILENAME = re.compile(r'[\\/:*?"<>|\r\n\t]+')
 
 
 class TaskStatus(str, Enum):
-    """任务状态机（PLAN.md §6）。单向推进，失败可回退到上一稳定态。"""
+    """任务状态机（PLAN.md §6）。单向推进，失败可回退到上一稳定态。
+
+    `CANCELLED` 是 2026-10-03（阶段 2）新增的：取消是**用户意图**，不是故障。
+    把它并进 `FAILED` 会让「失败 N 条」把用户自己点的取消也算进去，UI 上表现为
+    「我只想停一条，怎么报错了」。两者在调度器里走不同分支（见 `dispatcher.py`）。
+    """
 
     PENDING = "pending"
     DOWNLOADING = "downloading"
@@ -28,10 +33,12 @@ class TaskStatus(str, Enum):
     SUMMARIZING = "summarizing"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 #: 中途态 → 回退目标。进程被杀时这些状态不可信，启动时要重置。
 #: 例：downloading 说明下载没跑完，回退到 pending 重来。
+#: `CANCELLED` 刻意不在表里——用户主动取消的任务，重启后不该自己又跑起来。
 INTERRUPTED_ROLLBACK: dict[TaskStatus, TaskStatus] = {
     TaskStatus.DOWNLOADING: TaskStatus.PENDING,
     TaskStatus.TRANSCRIBING: TaskStatus.DOWNLOADED,
@@ -40,7 +47,7 @@ INTERRUPTED_ROLLBACK: dict[TaskStatus, TaskStatus] = {
 }
 
 #: 不需要重新处理的状态。
-TERMINAL_STATUSES = frozenset({TaskStatus.DONE})
+TERMINAL_STATUSES = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
 
 
 def now_iso() -> str:

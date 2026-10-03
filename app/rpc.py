@@ -31,13 +31,23 @@ from typing import Any, Callable, TextIO
 
 from app.core import concurrency as concurrency_mod
 from app.core import env_probe
+from app.core.dispatcher import Dispatcher
 from app.core.store import Store
 from app.core.urls import extract_many
 from app.models.config import Config
 from app.models.task import Task, TaskStatus
 
 PROTOCOL_VERSION = 1
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
+
+#: 内部事件名 → 协议事件名。
+#: 调度器不感知协议，它只报「发生了什么」；名字翻译在这里做，与 `STAGE_LABELS` 同理。
+EVENT_NAMES: dict[str, str] = {
+    "state": "pipeline_state",
+    "batch_done": "batch_done",
+    "batch_aborted": "batch_aborted",
+    "resource_warning": "resource_warning",
+}
 
 #: 协议唯一出口的原始引用。**必须在任何重定向之前拿到**，故置于模块级。
 raw_stdout: TextIO = sys.stdout
@@ -54,6 +64,7 @@ STAGE_LABELS: dict[str, str] = {
     TaskStatus.SUMMARIZING.value: "汇总中",
     TaskStatus.DONE.value: "完成",
     TaskStatus.FAILED.value: "失败",
+    TaskStatus.CANCELLED.value: "已取消",
 }
 
 
@@ -144,9 +155,8 @@ class _ProtocolLogHandler(logging.Handler):
 class Worker:
     """命令处理与生命周期管理。
 
-    阶段 1 只实现与「任务队列 + 环境」相关的命令；流水线命令
-    （`start` / `pause` / `resume` / `cancel_task` / `retry_task`）
-    依赖尚未实现的 `dispatcher`，统一回 `E_NOT_IMPLEMENTED`。
+    调度职责全部委托给 `app/core/dispatcher.py`：本类只做
+    「协议帧 ↔ 调度器调用」的翻译，不自己管线程与队列。
     """
 
     def __init__(self, cfg: Config, proto: Protocol, config_is_default: bool = False) -> None:
@@ -164,6 +174,14 @@ class Worker:
             cfg, self.env, gpu_usable=self.quick_gpu_usable
         )
 
+        self.dispatcher = Dispatcher(
+            cfg,
+            self.store,
+            self.concurrency,
+            on_task_update=self._on_task_update,
+            on_event=self._on_dispatcher_event,
+        )
+
         self._inbox: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._stop = threading.Event()
         self._handlers: dict[str, Callable[[dict[str, Any], str | None], None]] = {
@@ -173,13 +191,12 @@ class Worker:
             "remove_task": self._cmd_remove_task,
             "list_tasks": self._cmd_list_tasks,
             "get_concurrency": self._cmd_get_concurrency,
+            "start": self._cmd_start,
+            "pause": self._cmd_pause,
+            "resume": self._cmd_resume,
+            "cancel_task": self._cmd_cancel_task,
+            "retry_task": self._cmd_retry_task,
             "shutdown": self._cmd_shutdown,
-            # 流水线控制：等 dispatcher 落地后接上
-            "start": self._cmd_not_implemented,
-            "pause": self._cmd_not_implemented,
-            "resume": self._cmd_not_implemented,
-            "cancel_task": self._cmd_not_implemented,
-            "retry_task": self._cmd_not_implemented,
         }
 
     # ---- 启动 ----
@@ -258,8 +275,9 @@ class Worker:
         self.env.cuda.usable = ok
         self.env.cuda.detail = detail
         self.env.cuda.verified = True
-        # 验证结果可能改变 GPU 可用性 → 并发计划必须重算
+        # 验证结果可能改变 GPU 可用性 → 并发计划必须重算，并同步给调度器
         self.concurrency = concurrency_mod.plan(self.cfg, self.env, gpu_usable=ok)
+        self.dispatcher.conc = self.concurrency
         logging.info("环境验证：GPU %s —— %s", "可用" if ok else "不可用", detail)
         self.proto.emit(
             "env_verified",
@@ -342,6 +360,7 @@ class Worker:
                 "concurrency": self.concurrency.to_dict(),
                 "db_path": str(self.store.db_path),
                 "config_is_default": self.config_is_default,
+                "pipeline_state": self.dispatcher.state.value,
             },
             req_id,
         )
@@ -370,6 +389,7 @@ class Worker:
                         "url": stored.url,
                         "title": stored.title,
                         "platform": stored.platform,
+                        "status": stored.status,
                     }
                 )
             else:
@@ -383,6 +403,8 @@ class Worker:
         if not isinstance(task_id, int):
             self.proto.error("E_BAD_ARGS", "remove_task 需要整数 args.task_id", req_id=req_id)
             return
+        # 先取消：删除一条正在跑的任务，不能只从表里抹掉而让线程继续跑它的产出
+        self.dispatcher.cancel(task_id)
         removed = self.store.delete(task_id)
         if not removed:
             self.proto.error("E_BAD_ARGS", f"任务不存在：{task_id}", req_id=req_id)
@@ -399,28 +421,113 @@ class Worker:
     def _cmd_get_concurrency(self, args: dict[str, Any], req_id: str | None) -> None:
         self.proto.emit("concurrency", self.concurrency.to_dict(), req_id)
 
+    # ---- 流水线控制 ----
+
+    def _cmd_start(self, args: dict[str, Any], req_id: str | None) -> None:
+        """启动流水线：把可续跑的任务入队并启动线程池。幂等。
+
+        **只入队「可续跑」的任务**（pending / downloaded / transcribed 等非终态且
+        非 failed）。failed / cancelled 要显式 `retry_task` 才会再跑——否则一条永久
+        坏链会在每次点「开始」时被重试一遍，看起来像程序在空转。
+        """
+        resumable = self.store.resumable()
+        added = self.dispatcher.submit(resumable)
+        self.dispatcher.start()
+        logging.info("start：续跑入队 %d 条（state=%s）", added, self.dispatcher.state.value)
+        self.proto.emit(
+            "started",
+            {
+                "added": added,
+                "state": self.dispatcher.state.value,
+                "concurrency": self.concurrency.to_dict(),
+            },
+            req_id,
+        )
+
+    def _cmd_pause(self, args: dict[str, Any], req_id: str | None) -> None:
+        accepted = self.dispatcher.pause()
+        logging.info("pause：%s（state=%s）", "已接受" if accepted else "忽略", self.dispatcher.state.value)
+        self.proto.emit(
+            "paused", {"accepted": accepted, "state": self.dispatcher.state.value}, req_id
+        )
+
+    def _cmd_resume(self, args: dict[str, Any], req_id: str | None) -> None:
+        accepted = self.dispatcher.resume()
+        logging.info("resume：%s（state=%s）", "已接受" if accepted else "忽略", self.dispatcher.state.value)
+        self.proto.emit(
+            "resumed", {"accepted": accepted, "state": self.dispatcher.state.value}, req_id
+        )
+
+    def _cmd_cancel_task(self, args: dict[str, Any], req_id: str | None) -> None:
+        task_id = args.get("task_id")
+        if not isinstance(task_id, int):
+            self.proto.error("E_BAD_ARGS", "cancel_task 需要整数 args.task_id", req_id=req_id)
+            return
+        if not self.dispatcher.cancel(task_id):
+            self.proto.error("E_BAD_ARGS", f"任务无法取消（不存在或已完成）：{task_id}", req_id=req_id)
+            return
+        task = self.store.get(task_id)
+        if task is None:
+            self.proto.error("E_BAD_ARGS", f"任务不存在：{task_id}", req_id=req_id)
+            return
+        # 响应即当前快照：排队中的任务在这里已是 cancelled；运行中的还要等阶段
+        # 中断，最终态会以一次主动推送的 task_update 到达（id=null）。
+        self.proto.emit("task_update", self._task_payload(task), req_id)
+
+    def _cmd_retry_task(self, args: dict[str, Any], req_id: str | None) -> None:
+        task_id = args.get("task_id")
+        if not isinstance(task_id, int):
+            self.proto.error("E_BAD_ARGS", "retry_task 需要整数 args.task_id", req_id=req_id)
+            return
+        if not self.dispatcher.retry(task_id):
+            self.proto.error(
+                "E_BAD_ARGS", f"任务无法重试（不存在、已完成或仍在队列中）：{task_id}", req_id=req_id
+            )
+            return
+        self.dispatcher.start()  # 首次调用 retry 时线程池可能还没起
+        task = self.store.get(task_id)
+        if task is not None:
+            self.proto.emit("task_update", self._task_payload(task), req_id)
+
     def _cmd_shutdown(self, args: dict[str, Any], req_id: str | None) -> None:
-        logging.info("收到 shutdown，worker 退出")
+        logging.info("收到 shutdown，等待在跑的任务结束（最长 30 秒）")
+        self.dispatcher.stop(timeout=30.0)
+        logging.info("worker 退出")
         self.proto.emit("bye", {}, req_id)
         self._stop.set()
 
-    def _cmd_not_implemented(self, args: dict[str, Any], req_id: str | None) -> None:
-        self.proto.error(
-            "E_NOT_IMPLEMENTED",
-            "流水线调度尚未实现（依赖 app/core/dispatcher.py，阶段 2）",
-            req_id=req_id,
+    # ---- 调度器回调 ----
+
+    def _on_task_update(self, task: Task, progress: float, elapsed: float | None) -> None:
+        """调度器 → `task_update` 事件。**会从多个 worker 线程调用**，故 `emit` 必须加锁。"""
+        self.proto.emit(
+            "task_update",
+            self._task_payload(task, progress=progress, elapsed=elapsed),
         )
+
+    def _on_dispatcher_event(self, name: str, data: dict[str, Any]) -> None:
+        proto_name = EVENT_NAMES.get(name, name)
+        if proto_name == "batch_aborted":
+            # 环境级故障：不是进程级致命（worker 仍能响应命令），但整批停了，
+            # 所以同时给一条 fatal=false 的 error，让 Rust 侧有明确的错误通道。
+            self.proto.error("E_ENV_FATAL", str(data.get("reason", "")), fatal=False)
+        self.proto.emit(proto_name, data)
 
     # ---- 序列化 ----
 
     @staticmethod
-    def _task_payload(task: Task) -> dict[str, Any]:
+    def _task_payload(
+        task: Task,
+        progress: float | None = None,
+        elapsed: float | None = None,
+    ) -> dict[str, Any]:
         """Task → IPC `task_list` / `task_update` 用的快照结构。
 
         字段名与 `docs/IPC协议规格.md` §5.1 一致；不在协议里的字段（如
         `video_path`）刻意不外传，减少两端耦合面。
         """
-        is_done = task.status == TaskStatus.DONE.value
+        if progress is None:
+            progress = 1.0 if task.status == TaskStatus.DONE.value else 0.0
         return {
             "task_id": task.id,
             "url": task.url,
@@ -429,8 +536,8 @@ class Worker:
             "duration_sec": task.duration_sec,
             "status": task.status,
             "stage": STAGE_LABELS.get(task.status, task.status),
-            "progress": 1.0 if is_done else 0.0,
-            "elapsed_sec": None,
+            "progress": progress,
+            "elapsed_sec": elapsed,
             "retry_count": task.retry_count,
             "out_dir": task.out_dir,
             "error": task.stage_error,

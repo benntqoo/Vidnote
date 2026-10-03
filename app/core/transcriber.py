@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import wave
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from app.core import cuda_dll  # noqa: F401 — 副作用：注入 nvidia DLL 目录，必须最先执行
-from app.core.errors import FatalEnvironmentError, StageError
+from app.core.errors import FatalEnvironmentError, StageError, raise_if_cancelled
 
 if TYPE_CHECKING:  # 仅为类型标注，运行时不导入（导入时机受 cuda_dll 约束）
     from faster_whisper import WhisperModel
@@ -72,7 +73,18 @@ def load_model(
 
     多线程安全：用锁包住加载过程，避免两个 worker 同时载入同一份权重。
     """
-    from faster_whisper import WhisperModel  # 延迟导入：必须在 cuda_dll 之后
+    # 延迟导入：必须在 cuda_dll 之后。导入失败同样是**环境级**故障——
+    # 依赖没装进当前解释器时，后面每条任务都会在同一个地方失败，
+    # 按单条失败处理只会让整批跑成一场空转（2026-10-03 实测：11 条全 failed
+    # 而进程退出码 1，看起来像「输入有问题」）。故这里就升级成 FatalEnvironmentError。
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise FatalEnvironmentError(
+            "transcribe",
+            f"当前解释器缺少 faster-whisper：{sys.executable}\n"
+            "  安装：pip install -r requirements.txt（见 README 第 2 步）",
+        ) from exc
 
     path = Path(model_path)
     if not path.exists():
@@ -190,11 +202,16 @@ def run(
     device: str = "cuda",
     compute_type: str = "float16",
     on_progress: Callable[[str, float], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> TranscriptOutput:
     """转写 wav，产出 `<out_prefix>.txt` / `.srt` / `.json`。
 
     进度语义：`progress = 当前 segment 结束时间 / 音频总时长`——真实进度，
     来自 segment 时间戳而不是估计值（docs/IPC协议规格.md §5）。
+
+    `cancel_event` 的检查点只能放在 **segment 边界**：CTranslate2 的推理是
+    进程内 C++ 调用，没有中断接口。因此取消延迟 = 一个 segment 的时间
+    （实测 0.5~3 秒），而不是瞬时。这一点在 `IPC协议规格.md` §3 已如实写明。
     """
     src = Path(wav)
     if not src.is_file():
@@ -225,6 +242,9 @@ def run(
     total = float(info.duration or 0.0)
     rows: list[dict[str, Any]] = []
     for seg in segments_iter:
+        # 取消检查点：放在 segment 边界（唯一的可中断点，见 docstring）。
+        # 在这里抛会跳过 _write_outputs，因此不会留下半截转写稿。
+        raise_if_cancelled(cancel_event)
         rows.append(
             {
                 "start": round(seg.start, 2),

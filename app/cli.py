@@ -20,7 +20,10 @@ import shutil
 import sys
 from pathlib import Path
 
+from app.core import concurrency as concurrency_mod
 from app.core import env_probe
+from app.core.concurrency import Concurrency
+from app.core.dispatcher import Dispatcher
 from app.core.ffmpeg_locator import INSTALL_HINT as FFMPEG_HINT
 from app.core.ffmpeg_locator import describe as describe_ffmpeg
 from app.core.ffmpeg_locator import ffmpeg_available
@@ -37,6 +40,7 @@ EPILOG = f"""示例：
   python -m app.cli run "https://v.douyin.com/AbCdEf12345/"
   python -m app.cli run samples/video.mp4 --no-frames
   python -m app.cli run --file urls.txt --limit 10
+  python -m app.cli run --file urls.txt --jobs 1     # 串行（阶段 1 验收路径）
 
 ffmpeg 未安装时：{FFMPEG_HINT}
 """
@@ -90,8 +94,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="强制重跑：删除已有产出目录并清空该任务的路径字段（验收重跑用）",
     )
+    p_run.add_argument(
+        "--jobs",
+        default="auto",
+        help=(
+            "并发模式。auto=按实测内存与 GPU 自动规划（默认）；"
+            "1=串行，即阶段 1 验收走的那条路径；N=把下载/抽帧并发钉为 N（转写恒为 1）"
+        ),
+    )
     p_run.add_argument("--limit", type=int, help="最多处理前 N 条")
     p_run.add_argument("--dry-run", action="store_true", help="只入队不执行")
+    p_run.add_argument(
+        "--trace",
+        help="把调度器的阶段起止记录写成 JSON（含各阶段峰值并发）。验收与排查用",
+    )
 
     sub.add_parser("list", help="列出任务表（状态 / 产出目录）")
     return parser
@@ -189,16 +205,41 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         queued: list[Task] = []
         skipped = 0
+        resumed = 0
         for item in items:
             if item.platform == UNKNOWN_PLATFORM:
                 logging.warning("无法识别的输入，将原样交给 yt-dlp 尝试：%s", item.raw[:80])
             task, created = store.add(Task(url=item.target, platform=item.platform))
-            # --force 隐含 --retry：强制重跑当然包括「已存在」的任务
-            if not created and not (args.retry or args.force):
-                skipped += 1
-                logging.info("已存在，跳过（--retry 可强制重跑）：%s", item.target)
+            if created:
+                queued.append(task)
                 continue
+
+            # 以下是「已存在」的三种情况。这里就是断点续跑的入口：
+            if args.force:
+                queued.append(task)  # 显式要求重来
+                continue
+            if task.status == TaskStatus.DONE.value:
+                skipped += 1
+                logging.info("已完成，跳过（--force 可强制重跑）：%s", item.target)
+                continue
+            if task.status in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
+                if not args.retry:
+                    skipped += 1
+                    logging.info(
+                        "上次%s，跳过（--retry 可重跑）：%s",
+                        "失败" if task.status == TaskStatus.FAILED.value else "被取消",
+                        item.target,
+                    )
+                    continue
+                queued.append(task)
+                continue
+            # 非终态 → 上次没跑完，接着跑（**不需要 --retry**，这正是断点续跑）
+            resumed += 1
+            logging.info("未完成（%s），从断点续跑：%s", task.status, item.target)
             queued.append(task)
+
+        if resumed:
+            logging.info("其中 %d 条为断点续跑", resumed)
 
         if args.limit:
             queued = queued[: args.limit]
@@ -206,38 +247,127 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"待处理 {len(queued)} 条（dry-run，未执行）")
             return 0
 
-        ok = fail = 0
-        for index, task in enumerate(queued, 1):
-            logging.info("─" * 60)
-            logging.info("[%d/%d] 开始处理 task_id=%s：%s", index, len(queued), task.id, task.url)
-            task.set_status(TaskStatus.PENDING)
-            store.update(task)
-            if args.force:
+        jobs = _resolve_jobs(args.jobs)
+        if args.force:
+            for task in queued:
                 _clear_outputs(task, cfg, store)
-            try:
-                run_one(
-                    task,
-                    cfg,
-                    store,
-                    on_progress=_progress_printer(task.id),
-                    on_stage=_stage_printer(task.id),
-                )
-            except Exception:  # noqa: BLE001 — run_one 内已记录状态，这里只负责中止整批
-                logging.error("环境级故障，中止整批。修复后可用 --retry 续跑。")
-                fail += 1
-                break
-            if task.status == TaskStatus.DONE.value:
-                ok += 1
-                print(task.out_dir or "")
-            else:
-                fail += 1
 
-        logging.info(
-            "完成：成功 %d，失败 %d，跳过 %d（重复 %d）", ok, fail, len(queued) - ok - fail, skipped
-        )
-        return 0 if fail == 0 else 1
+        # --jobs 1 走串行 run_one：那是阶段 1 验收（与基线逐字符比对）的路径，
+        # 保留它既是「最小依赖的黄金路径」，也是排查并行侧问题时的对照组。
+        if jobs == 1:
+            return _run_serial(queued, cfg, store, skipped)
+        return _run_batch(queued, cfg, store, skipped, jobs, args.trace)
     finally:
         store.close()
+
+def _run_serial(queued: list[Task], cfg: Config, store: Store, skipped: int) -> int:
+    """串行执行：一条跑完再跑下一条。阶段 1 验收路径。"""
+    ok = fail = 0
+    for index, task in enumerate(queued, 1):
+        logging.info("─" * 60)
+        logging.info("[%d/%d] 开始处理 task_id=%s：%s", index, len(queued), task.id, task.url)
+        task.set_status(TaskStatus.PENDING)
+        store.update(task)
+        try:
+            run_one(
+                task,
+                cfg,
+                store,
+                on_progress=_progress_printer(task.id),
+                on_stage=_stage_printer(task.id),
+            )
+        except Exception:  # noqa: BLE001 — run_one 内已记录状态，这里只负责中止整批
+            logging.error("环境级故障，中止整批。修复后可用 --retry 续跑。")
+            fail += 1
+            break
+        if task.status == TaskStatus.DONE.value:
+            ok += 1
+            print(task.out_dir or "")
+        else:
+            fail += 1
+
+    logging.info(
+        "完成：成功 %d，失败 %d，跳过 %d（重复 %d）", ok, fail, len(queued) - ok - fail, skipped
+    )
+    return 0 if fail == 0 else 1
+
+
+def _run_batch(
+    queued: list[Task],
+    cfg: Config,
+    store: Store,
+    skipped: int,
+    jobs: int | None,
+    trace_path: str | None = None,
+) -> int:
+    """批量执行：交给 `dispatcher` 的阶段池（PLAN.md §3.1）。"""
+    report = env_probe.probe(cfg.work_path())
+    # 快速判据（device_count）决定并发形态，与 rpc.py 的口径一致：真实可用性由
+    # 转写阶段自己验证——那里失败会抛 FatalEnvironmentError 并中止整批。
+    conc = concurrency_mod.plan(cfg, report, gpu_usable=bool(report.cuda.device_count))
+    if jobs is not None:
+        # 转写恒为 1，这是本项目的架构决定（GPU 单卡串行），不是可调项
+        conc = Concurrency(n_asr=1, n_dl=jobs, n_frame=jobs, n_sum=conc.n_sum)
+
+    logging.info("并发计划：%s（内存可用 %s GB）", conc.to_dict(), report.memory.avail_gb or "?")
+
+    dispatcher = Dispatcher(
+        cfg,
+        store,
+        conc,
+        on_task_update=_batch_reporter(),
+        on_event=_batch_event_logger(),
+    )
+
+    # 与 `_run_serial` 的 `task.set_status(PENDING)` 对齐：进了 `queued` 就表示
+    # 「调用方已判定这条该跑」（新建 / --force / --retry / 断点续跑）。
+    # 必须在这里重新盖章——`dispatcher.submit` 会主动跳过 `done`，而 `--force`
+    # 与 `--retry` 要跑的恰恰就是 `done` / `failed` 的那几条。
+    # 2026-10-03 实测踩到：`run samples/video.mp4 --force` 删完产出目录后
+    # 一条都没入队，日志里只有「没有任务被入队」。
+    for task in queued:
+        if task.status in (TaskStatus.DONE.value, TaskStatus.CANCELLED.value):
+            task.set_status(TaskStatus.PENDING)
+            store.update(task)
+
+    if dispatcher.submit(queued) == 0:
+        logging.warning("没有任务被入队（可能都已完成）")
+        return 0
+
+    dispatcher.start()
+    try:
+        finished = dispatcher.wait()
+    except KeyboardInterrupt:
+        logging.warning("收到中断信号：停止取新任务，等在跑的跑完（最长 30 秒）")
+        logging.warning("已完成的进度存在 state.db，下次运行自动续跑")
+        dispatcher.stop(timeout=30)
+        finished = False
+
+    dispatcher.stop(timeout=30)
+    counts = store.count_by_status()
+    logging.info("批处理结束：%s", counts)
+    if dispatcher.abort_reason:
+        logging.error("整批因环境故障中止：%s", dispatcher.abort_reason)
+        logging.error("剩余未开始的任务保持 pending，修复后重跑即可续上")
+
+    if trace_path:
+        _write_trace(dispatcher, trace_path)
+
+    # stdout 只输出产出目录，便于 `> paths.txt`
+    for task in store.list([TaskStatus.DONE.value]):
+        print(task.out_dir or "")
+
+    fail = counts.get(TaskStatus.FAILED.value, 0)
+    logging.info(
+        "完成：成功 %d，失败 %d，取消 %d，入队时跳过重复 %d",
+        counts.get(TaskStatus.DONE.value, 0),
+        fail,
+        counts.get(TaskStatus.CANCELLED.value, 0),
+        skipped,
+    )
+    if not finished and not dispatcher.abort_reason:
+        return 1
+    return 0 if fail == 0 else 1
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -337,6 +467,39 @@ def _collect_inputs(args: argparse.Namespace) -> list:
     return extract_many(lines)
 
 
+def _write_trace(dispatcher: Dispatcher, path: str) -> None:
+    """落盘调度器的阶段起止记录。
+
+    存在的意义：**验收要能证伪「流水线架构」这个设计推断**（PLAN.md §11.2）。
+    只看总耗时证不了——总耗时短也可能只是「每条都短」。得看区间是否真的重叠。
+    """
+    import json
+
+    spans = [span.to_dict() for span in dispatcher.trace]
+    payload = {
+        "concurrency": dispatcher.conc.to_dict(),
+        "spans": spans,
+        "peak_concurrency": dispatcher.peak_concurrency(),
+        "summary": dispatcher.snapshot(),
+        "total_stage_seconds": round(sum(span["seconds"] for span in spans), 3),
+        "wall_seconds": (
+            round(max(s["ended"] for s in spans) - min(s["started"] for s in spans), 3)
+            if spans
+            else 0.0
+        ),
+    }
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info(
+        "调度轨迹已写出：%s（阶段总耗时 %.1fs / 墙钟 %.1fs，峰值并发 %s）",
+        out,
+        payload["total_stage_seconds"],
+        payload["wall_seconds"],
+        payload["peak_concurrency"],
+    )
+
+
 def _progress_printer(task_id: int | None):
     """把 `(stage, ratio)` 转成 stderr 上的稀疏进度行。
 
@@ -363,6 +526,68 @@ def _stage_printer(task_id: int | None):
         print(line, file=sys.stderr, flush=True)
 
     return fn
+
+
+def _batch_reporter():
+    """批量模式下的进度行。每个 task_id 各自记一份「上次打印到几 %」。
+
+    与串行版的 `_progress_printer` 同样的稀疏策略（每 5% 一行）——十来个任务
+    同时刷进度，不打稀疏会把 stderr 淹掉，反而看不见有价值的信息。
+    """
+    states: dict[int, dict] = {}
+
+    def on_update(task: Task, progress: float, elapsed: float | None) -> None:
+        key = task.id if task.id is not None else -1
+        state = states.setdefault(key, {"last": -1, "status": None, "reported_error": None})
+        if task.status != state["status"]:
+            state["status"] = task.status
+            state["last"] = -1
+            line = f"  [task {key}] → {task.status}"
+            if task.stage_error:
+                line += f"  ⚠️ {task.stage_error.splitlines()[0][:120]}"
+            print(line, file=sys.stderr, flush=True)
+        if progress is None or progress < 0:
+            return
+        pct = int(progress * 100)
+        if pct >= state["last"] + 5 or pct == 100:
+            state["last"] = pct
+            print(
+                f"  [task {key}] {task.status:<12} {pct:3d}%",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return on_update
+
+
+def _batch_event_logger():
+    """批级事件（运行中才发现的信息）转到日志。"""
+
+    def on_event(name: str, data: dict) -> None:
+        if name == "resource_warning":
+            logging.warning("资源告警：%s", data)
+        elif name == "batch_aborted":
+            logging.error("批处理中止：%s", data.get("reason"))
+        elif name == "batch_done":
+            logging.info("批处理完成：%s", data.get("counts"))
+        elif name == "state":
+            logging.debug("调度器状态：%s", data.get("state"))
+
+    return on_event
+
+
+def _resolve_jobs(value: str) -> int | None:
+    """解析 `--jobs`。返回 None 表示 auto（交给并发规划），1 表示串行。"""
+    text = str(value).strip().lower()
+    if text in ("auto", "", "0"):
+        return None
+    try:
+        jobs = int(text)
+    except ValueError as exc:
+        raise SystemExit(f"--jobs 取值非法：{value!r}（应为 auto 或正整数）") from exc
+    if jobs < 1:
+        raise SystemExit(f"--jobs 必须 >= 1，当前 {jobs}")
+    return jobs
 
 
 def _dir_size_gb(path: Path) -> float:
