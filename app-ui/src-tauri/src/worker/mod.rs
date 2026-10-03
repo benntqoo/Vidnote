@@ -319,19 +319,8 @@ impl Worker {
                                 continue;
                             }
                             eprintln!("[py] {l}");
-                            // 同时转给前端日志区，带标志让前端区分来源
-                            let _ = inner.app.emit(
-                                EVENT_CHANNEL,
-                                json!({
-                                    "v": protocol::PROTOCOL_VERSION,
-                                    "type": "evt",
-                                    "name": "log",
-                                    "id": null,
-                                    "seq": null,
-                                    "ts": 0.0,
-                                    "data": {"level": "debug", "msg": l, "source": "stderr"}
-                                }),
-                            );
+                            // 同时转给前端日志区，`source` 让前端区分来源
+                            inner.emit_log("debug", "stderr", l);
                         }
                         Err(_) => break,
                     }
@@ -358,15 +347,7 @@ impl Worker {
             let last = *inner.last_pong.lock().unwrap();
             if last.elapsed() > PING_INTERVAL + Duration::from_secs(2) {
                 let missed = inner.missed_pongs.fetch_add(1, Ordering::SeqCst) + 1;
-                let _ = inner.app.emit(
-                    EVENT_CHANNEL,
-                    json!({
-                        "v": protocol::PROTOCOL_VERSION, "type": "evt", "name": "log",
-                        "id": null, "seq": null, "ts": 0.0,
-                        "data": {"level": "warning",
-                                 "msg": format!("心跳超时（第 {missed} 次未收到 pong）")}
-                    }),
-                );
+                inner.emit_log("warning", "supervisor", format!("心跳超时（第 {missed} 次未收到 pong）"));
                 if missed >= MISSED_PONG_LIMIT as u64 {
                     inner.alive.store(false, Ordering::SeqCst);
                     // 必须经由统一发射口。这里原来直接 `app.emit(STATE_CHANNEL, ..)`，
@@ -458,6 +439,29 @@ impl Inner {
         }
     }
 
+    /// 日志事件的**唯一**发射口。
+    ///
+    /// 与 `emit_state` 同样的理由：手写 `app.emit(EVENT_CHANNEL, json!{..})` 的地方
+    /// 一旦多起来，就会出现「有的路径记了、有的没记」。
+    ///
+    /// `source` 区分来源（`stderr` = Python 侧日志，`supervisor` = Rust 监督器），
+    /// 前端日志区直接展示。**不要**把 Python 的 stdout/stderr 都塞成同一个 source——
+    /// 排查时「这行是 Python 说的还是 Rust 说的」是第一个要回答的问题。
+    fn emit_log(&self, level: &str, source: &str, msg: impl Into<String>) {
+        let _ = self.app.emit(
+            EVENT_CHANNEL,
+            json!({
+                "v": protocol::PROTOCOL_VERSION,
+                "type": "evt",
+                "name": "log",
+                "id": null,
+                "seq": null,
+                "ts": 0.0,
+                "data": {"level": level, "msg": msg.into(), "source": source}
+            }),
+        );
+    }
+
     /// 状态快照的**唯一**发射口。所有状态变更都必须经过这里。
     ///
     /// 之前这里有两个几乎相同的函数（`Worker::emit_state` 与 `emit_state_locked`），
@@ -488,6 +492,13 @@ impl Inner {
     }
 
     /// stdout 读到 EOF —— worker 已退出。
+    ///
+    /// 退出**必须同时进日志区**，不能只更新状态快照：状态栏只显示 detail 的首行，
+    /// 而用户排查时的第一反应是去翻日志 —— 那里若还停在崩溃前的最后一条，
+    /// 得到的印象会是「一切正常，然后就没了」。
+    ///
+    /// 实测（2026-10-03 崩溃注入）：不加这一条时，杀了 worker 之后日志区最后一行
+    /// 仍是崩溃前的 `环境验证：GPU 可用`，看不出已经出事。
     fn on_worker_exit(&self) {
         let already_dead = !self.alive.swap(false, Ordering::SeqCst);
         self.stop_heartbeat.store(true, Ordering::SeqCst);
@@ -502,9 +513,11 @@ impl Inner {
             .and_then(|s| s.code());
 
         if self.shutting_down.load(Ordering::SeqCst) {
+            let detail = format!("worker 已正常退出（code={code:?}）");
+            self.emit_log("info", "supervisor", detail.clone());
             let mut snap = self.snapshot.lock().unwrap();
             snap.state = "exited".into();
-            snap.detail = format!("worker 已正常退出（code={code:?}）");
+            snap.detail = detail;
             snap.alive = false;
             drop(snap);
             self.emit_state();
@@ -515,11 +528,13 @@ impl Inner {
             return; // 心跳线程已报过，不重复
         }
 
-        let mut snap = self.snapshot.lock().unwrap();
-        snap.state = "exited".into();
-        snap.detail = format!(
+        let detail = format!(
             "worker 意外退出（code={code:?}）。规格 §7 要求自动重启一次；当前版本先如实上报，未自动重启。"
         );
+        self.emit_log("error", "supervisor", detail.clone());
+        let mut snap = self.snapshot.lock().unwrap();
+        snap.state = "exited".into();
+        snap.detail = detail;
         snap.alive = false;
         drop(snap);
         self.emit_state();

@@ -83,7 +83,13 @@ export function StatusBar({ worker, pipeline }: Props) {
 
       <span className="spacer" />
 
-      {worker?.state === "failed" && (
+      {/*
+        `failed` 与 `exited` 都要显示原因。
+        两者对用户是同一件事：worker 不在了、按钮全灰、什么都做不了 —— 此刻唯一的
+        诉求就是「为什么」。把 detail 只放在 chip 的 tooltip 里，等于没给。
+        （实测：只认 `failed` 时，意外退出只显示「worker 已退出」，原因一个字都看不到。）
+      */}
+      {worker && (worker.state === "failed" || worker.state === "exited") && (
         <span className="statusbar-detail" title={worker.detail}>
           {worker.detail.split("\n")[0]}
         </span>
